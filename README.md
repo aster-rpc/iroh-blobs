@@ -1,3 +1,22 @@
+# iroh-blobs (aster-rpc fork)
+
+This fork tracks [upstream iroh-blobs](https://github.com/n0-computer/iroh-blobs) and contributes security fixes back. Fixes focus on protocol input validation, file import safety, error handling, and store robustness.
+
+## Contributions
+
+| PR | Area | Summary | Upstream |
+|----|------|---------|----------|
+| [#1](https://github.com/aster-rpc/iroh-blobs/pull/1) | Security | Overflow protection for RangeSpec and HashSeq size limit | Pending |
+| [#2](https://github.com/aster-rpc/iroh-blobs/pull/2) | Security | Symlink resolution and TOCTOU fix for file import | Pending |
+| [#3](https://github.com/aster-rpc/iroh-blobs/pull/3) | Security | Descriptive panics and GC safety docs | Pending |
+| [#4](https://github.com/aster-rpc/iroh-blobs/pull/4) | Security | Correct MAX_MESSAGE_SIZE doc comment | Pending |
+
+---
+
+*Below is the original upstream README.*
+
+---
+
 # iroh-blobs
 
 **NOTE: this version of iroh-blobs is not yet considered production quality. For now, if you need production quality, use iroh-blobs 0.35**
