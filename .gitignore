@@ -1,3 +1,5 @@
 /target
 iroh.config.toml
 .vscode/*
+
+docs/aster/
