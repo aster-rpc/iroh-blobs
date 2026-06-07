@@ -507,6 +507,10 @@ impl Actor {
                 trace!("{cmd:?}");
                 self.db().send(cmd.into()).await.ok();
             }
+            Command::BlobStatusMany(cmd) => {
+                trace!("{cmd:?}");
+                self.db().send(cmd.into()).await.ok();
+            }
             Command::BlobBytes(cmd) => {
                 trace!("{cmd:?}");
                 self.db().send(cmd.into()).await.ok();
@@ -1509,7 +1513,7 @@ pub mod tests {
 
     use super::*;
     use crate::{
-        api::blobs::Bitfield,
+        api::blobs::{Bitfield, BlobStatus},
         store::{
             util::{read_checksummed, tests::create_n0_bao, SliceInfoExt, Tag},
             IROH_BLOCK_SIZE,
@@ -1669,6 +1673,44 @@ pub mod tests {
         assert!(results.next().unwrap()?.is_none());
         assert_eq!(results.next().unwrap()?.as_deref(), Some(large.as_ref()));
         assert!(results.next().is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_status_many() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let db_dir = testdir.path().join("db");
+        let store = FsStore::load(&db_dir).await?;
+
+        let small = test_data(1024);
+        let small_hash = Hash::new(&small);
+        let small_tag = store.add_bytes(small).await?;
+        assert_eq!(small_hash, small_tag.hash);
+
+        let large = test_data(1024 * 16 + 1);
+        let large_hash = Hash::new(&large);
+        let large_tag = store.add_bytes(large).await?;
+        assert_eq!(large_hash, large_tag.hash);
+
+        let missing = Hash::new(b"missing");
+        let statuses = store
+            .status_many(vec![small_hash, missing, large_hash])
+            .await?;
+
+        assert_eq!(
+            statuses,
+            vec![
+                BlobStatus::Complete { size: 1024 },
+                BlobStatus::NotFound,
+                BlobStatus::Complete {
+                    size: 1024 * 16 + 1,
+                },
+            ],
+        );
+        assert_eq!(store.status(small_hash).await?, statuses[0]);
+        assert_eq!(store.status(missing).await?, statuses[1]);
+        assert_eq!(store.status(large_hash).await?, statuses[2]);
 
         Ok(())
     }

@@ -36,10 +36,10 @@ use crate::{
         self,
         blobs::{Bitfield, ExportProgressItem},
         proto::{
-            self, BlobBytesRequest, BlobBytesResult, BlobStatus, Command, ExportBaoMsg,
-            ExportBaoRequest, ExportPathMsg, ExportPathRequest, ExportRangesItem, ExportRangesMsg,
-            ExportRangesRequest, ImportBaoMsg, ImportByteStreamMsg, ImportBytesMsg, ImportPathMsg,
-            ObserveMsg, ObserveRequest, WaitIdleMsg,
+            self, BlobBytesRequest, BlobBytesResult, BlobStatus, BlobStatusManyRequest, Command,
+            ExportBaoMsg, ExportBaoRequest, ExportPathMsg, ExportPathRequest, ExportRangesItem,
+            ExportRangesMsg, ExportRangesRequest, ImportBaoMsg, ImportByteStreamMsg,
+            ImportBytesMsg, ImportPathMsg, ObserveMsg, ObserveRequest, WaitIdleMsg,
         },
         ApiClient, TempTag,
     },
@@ -205,6 +205,21 @@ impl Actor {
                     BlobStatus::NotFound
                 };
                 cmd.tx.send(status).await.ok();
+            }
+            Command::BlobStatusMany(cmd) => {
+                let BlobStatusManyRequest { hashes } = cmd.inner;
+                let mut out = Vec::with_capacity(hashes.len());
+                for hash in hashes {
+                    let status = if let Some(entry) = self.data.get(&hash) {
+                        BlobStatus::Complete {
+                            size: entry.data.len() as u64,
+                        }
+                    } else {
+                        BlobStatus::NotFound
+                    };
+                    out.push(status);
+                }
+                cmd.tx.send(out).await.ok();
             }
             Command::BlobBytes(cmd) => {
                 let BlobBytesRequest { hashes } = cmd.inner;

@@ -106,6 +106,8 @@ pub enum Request {
     Observe(ObserveRequest),
     #[rpc(tx = oneshot::Sender<BlobStatus>)]
     BlobStatus(BlobStatusRequest),
+    #[rpc(tx = oneshot::Sender<Vec<BlobStatus>>)]
+    BlobStatusMany(BlobStatusManyRequest),
     #[rpc(tx = oneshot::Sender<super::Result<Vec<BlobBytesResult>>>)]
     BlobBytes(BlobBytesRequest),
     #[rpc(tx = mpsc::Sender<AddProgressItem>)]
@@ -155,6 +157,11 @@ pub struct ClearProtectedRequest;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BlobStatusRequest {
     pub hash: Hash,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BlobStatusManyRequest {
+    pub hashes: Vec<Hash>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

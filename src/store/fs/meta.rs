@@ -20,9 +20,10 @@ use crate::{
         self,
         blobs::{BlobBytesResult, BlobStatus},
         proto::{
-            BlobBytesMsg, BlobBytesRequest, BlobDeleteRequest, BlobStatusMsg, BlobStatusRequest,
-            ClearProtectedMsg, CreateTagRequest, DeleteBlobsMsg, DeleteTagsRequest, ListBlobsMsg,
-            ListRequest, ListTagsRequest, RenameTagRequest, SetTagRequest, ShutdownMsg, SyncDbMsg,
+            BlobBytesMsg, BlobBytesRequest, BlobDeleteRequest, BlobStatusManyMsg,
+            BlobStatusManyRequest, BlobStatusMsg, BlobStatusRequest, ClearProtectedMsg,
+            CreateTagRequest, DeleteBlobsMsg, DeleteTagsRequest, ListBlobsMsg, ListRequest,
+            ListTagsRequest, RenameTagRequest, SetTagRequest, ShutdownMsg, SyncDbMsg,
         },
         tags::TagInfo,
         Tag,
@@ -287,6 +288,40 @@ async fn handle_clear_protected(
     Ok(())
 }
 
+fn blob_status(tables: &impl ReadableTables, hash: Hash) -> ActorResult<BlobStatus> {
+    Ok(
+        match tables
+            .blobs()
+            .get(hash)
+            .map_err(|e| e!(ActorError::Storage, e))?
+        {
+            Some(entry) => match entry.value() {
+                EntryState::Complete { data_location, .. } => match data_location {
+                    DataLocation::Inline(_) => {
+                        let Some(data) = tables
+                            .inline_data()
+                            .get(hash)
+                            .map_err(|e| e!(ActorError::Storage, e))?
+                        else {
+                            return Err(ActorError::inconsistent(format!(
+                                "inconsistent database state: {} not found",
+                                hash.to_hex()
+                            )));
+                        };
+                        BlobStatus::Complete {
+                            size: data.value().len() as u64,
+                        }
+                    }
+                    DataLocation::Owned(size) => BlobStatus::Complete { size },
+                    DataLocation::External(_, size) => BlobStatus::Complete { size },
+                },
+                EntryState::Partial { size } => BlobStatus::Partial { size },
+            },
+            None => BlobStatus::NotFound,
+        },
+    )
+}
+
 async fn handle_get_blob_status(
     msg: BlobStatusMsg,
     tables: &impl ReadableTables,
@@ -297,36 +332,26 @@ async fn handle_get_blob_status(
         tx,
         ..
     } = msg;
-    let res = match tables
-        .blobs()
-        .get(hash)
-        .map_err(|e| e!(ActorError::Storage, e))?
-    {
-        Some(entry) => match entry.value() {
-            EntryState::Complete { data_location, .. } => match data_location {
-                DataLocation::Inline(_) => {
-                    let Some(data) = tables
-                        .inline_data()
-                        .get(hash)
-                        .map_err(|e| e!(ActorError::Storage, e))?
-                    else {
-                        return Err(ActorError::inconsistent(format!(
-                            "inconsistent database state: {} not found",
-                            hash.to_hex()
-                        )));
-                    };
-                    BlobStatus::Complete {
-                        size: data.value().len() as u64,
-                    }
-                }
-                DataLocation::Owned(size) => BlobStatus::Complete { size },
-                DataLocation::External(_, size) => BlobStatus::Complete { size },
-            },
-            EntryState::Partial { size } => BlobStatus::Partial { size },
-        },
-        None => BlobStatus::NotFound,
-    };
+    let res = blob_status(tables, hash)?;
     tx.send(res).await.ok();
+    Ok(())
+}
+
+async fn handle_get_blob_status_many(
+    msg: BlobStatusManyMsg,
+    tables: &impl ReadableTables,
+) -> ActorResult<()> {
+    trace!("{msg:?}");
+    let BlobStatusManyMsg {
+        inner: BlobStatusManyRequest { hashes },
+        tx,
+        ..
+    } = msg;
+    let mut out = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        out.push(blob_status(tables, hash)?);
+    }
+    tx.send(out).await.ok();
     Ok(())
 }
 
@@ -614,6 +639,9 @@ impl Actor {
             ReadOnlyCommand::ListTags(cmd) => handle_list_tags(cmd, tables).await,
             ReadOnlyCommand::ClearProtected(cmd) => handle_clear_protected(cmd, protected).await,
             ReadOnlyCommand::GetBlobStatus(cmd) => handle_get_blob_status(cmd, tables).await,
+            ReadOnlyCommand::GetBlobStatusMany(cmd) => {
+                handle_get_blob_status_many(cmd, tables).await
+            }
             ReadOnlyCommand::GetBlobBytes(cmd) => handle_get_blob_bytes(cmd, tables).await,
         }
     }
