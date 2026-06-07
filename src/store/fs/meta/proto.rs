@@ -89,6 +89,8 @@ impl fmt::Debug for Set {
     }
 }
 
+/// Read method: get complete local bytes for multiple blobs.
+pub use crate::api::proto::BlobBytesMsg;
 /// Modification method: create a new unique tag and set it to a value.
 pub use crate::api::proto::CreateTagMsg;
 /// Modification method: remove a range of tags.
@@ -108,6 +110,7 @@ pub enum ReadOnlyCommand {
     ListTags(ListTagsMsg),
     ClearProtected(ClearProtectedMsg),
     GetBlobStatus(BlobStatusMsg),
+    GetBlobBytes(BlobBytesMsg),
 }
 
 impl ReadOnlyCommand {
@@ -124,6 +127,7 @@ impl ReadOnlyCommand {
             Self::ListTags(x) => x.parent_span_opt(),
             Self::ClearProtected(x) => x.parent_span_opt(),
             Self::GetBlobStatus(x) => x.parent_span_opt(),
+            Self::GetBlobBytes(x) => x.parent_span_opt(),
         }
     }
 }

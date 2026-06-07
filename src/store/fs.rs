@@ -507,6 +507,10 @@ impl Actor {
                 trace!("{cmd:?}");
                 self.db().send(cmd.into()).await.ok();
             }
+            Command::BlobBytes(cmd) => {
+                trace!("{cmd:?}");
+                self.db().send(cmd.into()).await.ok();
+            }
             Command::DeleteBlobs(cmd) => {
                 trace!("{cmd:?}");
                 self.db().send(cmd.into()).await.ok();
@@ -1636,6 +1640,36 @@ pub mod tests {
         }
         store.shutdown().await?;
         dump_dir_full(db_dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_bytes_many_if_complete() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let db_dir = testdir.path().join("db");
+        let store = FsStore::load(&db_dir).await?;
+
+        let small = test_data(1024);
+        let small_hash = Hash::new(&small);
+        let small_tag = store.add_bytes(small.clone()).await?;
+        assert_eq!(small_hash, small_tag.hash);
+
+        let large = test_data(1024 * 16 + 1);
+        let large_hash = Hash::new(&large);
+        let large_tag = store.add_bytes(large.clone()).await?;
+        assert_eq!(large_hash, large_tag.hash);
+
+        let missing = Hash::new(b"missing");
+        let mut results = store
+            .get_bytes_many_if_complete(vec![small_hash, missing, large_hash])
+            .await?
+            .into_iter();
+
+        assert_eq!(results.next().unwrap()?.as_deref(), Some(small.as_ref()));
+        assert!(results.next().unwrap()?.is_none());
+        assert_eq!(results.next().unwrap()?.as_deref(), Some(large.as_ref()));
+        assert!(results.next().is_none());
+
         Ok(())
     }
 
