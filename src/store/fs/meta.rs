@@ -18,11 +18,11 @@ use tokio::pin;
 use crate::{
     api::{
         self,
-        blobs::BlobStatus,
+        blobs::{BlobBytesResult, BlobStatus},
         proto::{
-            BlobDeleteRequest, BlobStatusMsg, BlobStatusRequest, ClearProtectedMsg,
-            CreateTagRequest, DeleteBlobsMsg, DeleteTagsRequest, ListBlobsMsg, ListRequest,
-            ListTagsRequest, RenameTagRequest, SetTagRequest, ShutdownMsg, SyncDbMsg,
+            BlobBytesMsg, BlobBytesRequest, BlobDeleteRequest, BlobStatusMsg, BlobStatusRequest,
+            ClearProtectedMsg, CreateTagRequest, DeleteBlobsMsg, DeleteTagsRequest, ListBlobsMsg,
+            ListRequest, ListTagsRequest, RenameTagRequest, SetTagRequest, ShutdownMsg, SyncDbMsg,
         },
         tags::TagInfo,
         Tag,
@@ -330,6 +330,63 @@ async fn handle_get_blob_status(
     Ok(())
 }
 
+async fn handle_get_blob_bytes(msg: BlobBytesMsg, tables: &impl ReadableTables) -> ActorResult<()> {
+    trace!("{msg:?}");
+    let BlobBytesMsg {
+        inner: BlobBytesRequest { hashes },
+        tx,
+        ..
+    } = msg;
+    let mut out = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        if hash == Hash::EMPTY {
+            out.push(BlobBytesResult::Complete { data: Bytes::new() });
+            continue;
+        }
+
+        let res = match tables
+            .blobs()
+            .get(hash)
+            .map_err(|e| e!(ActorError::Storage, e))?
+        {
+            Some(entry) => match entry.value() {
+                EntryState::Complete { data_location, .. } => match data_location {
+                    DataLocation::Inline(_) => {
+                        let Some(data) = tables
+                            .inline_data()
+                            .get(hash)
+                            .map_err(|e| e!(ActorError::Storage, e))?
+                        else {
+                            return Err(ActorError::inconsistent(format!(
+                                "inconsistent database state: {} not found",
+                                hash.to_hex()
+                            )));
+                        };
+                        let data = data.value();
+                        if Hash::new(data) != hash {
+                            return Err(ActorError::inconsistent(format!(
+                                "inline data hash mismatch for {}",
+                                hash.to_hex()
+                            )));
+                        }
+                        BlobBytesResult::Complete {
+                            data: Bytes::copy_from_slice(data),
+                        }
+                    }
+                    DataLocation::Owned(size) | DataLocation::External(_, size) => {
+                        BlobBytesResult::NeedsExport { size }
+                    }
+                },
+                EntryState::Partial { size } => BlobBytesResult::Partial { size },
+            },
+            None => BlobBytesResult::NotFound,
+        };
+        out.push(res);
+    }
+    tx.send(Ok(out)).await.ok();
+    Ok(())
+}
+
 async fn handle_list_tags(msg: ListTagsMsg, tables: &impl ReadableTables) -> ActorResult<()> {
     trace!("{msg:?}");
     let ListTagsMsg {
@@ -557,6 +614,7 @@ impl Actor {
             ReadOnlyCommand::ListTags(cmd) => handle_list_tags(cmd, tables).await,
             ReadOnlyCommand::ClearProtected(cmd) => handle_clear_protected(cmd, protected).await,
             ReadOnlyCommand::GetBlobStatus(cmd) => handle_get_blob_status(cmd, tables).await,
+            ReadOnlyCommand::GetBlobBytes(cmd) => handle_get_blob_bytes(cmd, tables).await,
         }
     }
 

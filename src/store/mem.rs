@@ -44,10 +44,11 @@ use crate::{
         self,
         blobs::{AddProgressItem, Bitfield, BlobStatus, ExportProgressItem},
         proto::{
-            BatchMsg, BatchResponse, BlobDeleteRequest, BlobStatusMsg, BlobStatusRequest, Command,
-            CreateTagMsg, CreateTagRequest, CreateTempTagMsg, DeleteBlobsMsg, DeleteTagsMsg,
-            DeleteTagsRequest, ExportBaoMsg, ExportBaoRequest, ExportPathMsg, ExportPathRequest,
-            ExportRangesItem, ExportRangesMsg, ExportRangesRequest, ImportBaoMsg, ImportBaoRequest,
+            BatchMsg, BatchResponse, BlobBytesMsg, BlobBytesRequest, BlobBytesResult,
+            BlobDeleteRequest, BlobStatusMsg, BlobStatusRequest, Command, CreateTagMsg,
+            CreateTagRequest, CreateTempTagMsg, DeleteBlobsMsg, DeleteTagsMsg, DeleteTagsRequest,
+            ExportBaoMsg, ExportBaoRequest, ExportPathMsg, ExportPathRequest, ExportRangesItem,
+            ExportRangesMsg, ExportRangesRequest, ImportBaoMsg, ImportBaoRequest,
             ImportByteStreamMsg, ImportByteStreamUpdate, ImportBytesMsg, ImportBytesRequest,
             ImportPathMsg, ImportPathRequest, ListBlobsMsg, ListTagsMsg, ListTagsRequest,
             ObserveMsg, ObserveRequest, RenameTagMsg, RenameTagRequest, Scope, SetTagMsg,
@@ -378,6 +379,46 @@ impl Actor {
                     }
                 };
                 tx.send(res).await.ok();
+            }
+            Command::BlobBytes(cmd) => {
+                trace!("{cmd:?}");
+                let BlobBytesMsg {
+                    inner: BlobBytesRequest { hashes },
+                    tx,
+                    ..
+                } = cmd;
+                let mut out = Vec::with_capacity(hashes.len());
+                let mut error = None;
+                for hash in hashes {
+                    let res = match self.get(&hash) {
+                        None => BlobBytesResult::NotFound,
+                        Some(entry) => {
+                            let state = entry.0.state.borrow();
+                            match &*state {
+                                BaoFileStorage::Complete(complete) => {
+                                    if Hash::new(&complete.data) != hash {
+                                        error = Some(api::Error::other(format!(
+                                            "data hash mismatch for {}",
+                                            hash.to_hex()
+                                        )));
+                                        break;
+                                    }
+                                    BlobBytesResult::Complete {
+                                        data: complete.data.clone(),
+                                    }
+                                }
+                                BaoFileStorage::Partial(partial) => BlobBytesResult::Partial {
+                                    size: partial.bitfield.validated_size(),
+                                },
+                            }
+                        }
+                    };
+                    out.push(res);
+                }
+                match error {
+                    Some(error) => tx.send(Err(error)).await.ok(),
+                    None => tx.send(Ok(out)).await.ok(),
+                };
             }
             Command::DeleteBlobs(cmd) => {
                 trace!("{cmd:?}");

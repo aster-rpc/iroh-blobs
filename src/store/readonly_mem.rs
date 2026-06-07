@@ -36,10 +36,10 @@ use crate::{
         self,
         blobs::{Bitfield, ExportProgressItem},
         proto::{
-            self, BlobStatus, Command, ExportBaoMsg, ExportBaoRequest, ExportPathMsg,
-            ExportPathRequest, ExportRangesItem, ExportRangesMsg, ExportRangesRequest,
-            ImportBaoMsg, ImportByteStreamMsg, ImportBytesMsg, ImportPathMsg, ObserveMsg,
-            ObserveRequest, WaitIdleMsg,
+            self, BlobBytesRequest, BlobBytesResult, BlobStatus, Command, ExportBaoMsg,
+            ExportBaoRequest, ExportPathMsg, ExportPathRequest, ExportRangesItem, ExportRangesMsg,
+            ExportRangesRequest, ImportBaoMsg, ImportByteStreamMsg, ImportBytesMsg, ImportPathMsg,
+            ObserveMsg, ObserveRequest, WaitIdleMsg,
         },
         ApiClient, TempTag,
     },
@@ -205,6 +205,32 @@ impl Actor {
                     BlobStatus::NotFound
                 };
                 cmd.tx.send(status).await.ok();
+            }
+            Command::BlobBytes(cmd) => {
+                let BlobBytesRequest { hashes } = cmd.inner;
+                let mut out = Vec::with_capacity(hashes.len());
+                let mut error = None;
+                for hash in hashes {
+                    let res = if let Some(entry) = self.data.get(&hash) {
+                        if Hash::new(&entry.data) != hash {
+                            error = Some(api::Error::other(format!(
+                                "data hash mismatch for {}",
+                                hash.to_hex()
+                            )));
+                            break;
+                        }
+                        BlobBytesResult::Complete {
+                            data: entry.data.clone(),
+                        }
+                    } else {
+                        BlobBytesResult::NotFound
+                    };
+                    out.push(res);
+                }
+                match error {
+                    Some(error) => cmd.tx.send(Err(error)).await.ok(),
+                    None => cmd.tx.send(Ok(out)).await.ok(),
+                };
             }
             Command::ListTags(cmd) => {
                 cmd.tx.send(Vec::new()).await.ok();

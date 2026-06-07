@@ -39,16 +39,16 @@ pub use reader::BlobReader;
 // Due to the fact that the proto module is hidden from docs by default,
 // these will appear in the docs as if they were declared here.
 pub use super::proto::{
-    AddProgressItem, Bitfield, BlobDeleteRequest as DeleteOptions, BlobStatus,
+    AddProgressItem, Bitfield, BlobBytesResult, BlobDeleteRequest as DeleteOptions, BlobStatus,
     ExportBaoRequest as ExportBaoOptions, ExportMode, ExportPathRequest as ExportOptions,
     ExportProgressItem, ExportRangesRequest as ExportRangesOptions,
     ImportBaoRequest as ImportBaoOptions, ImportMode, ObserveRequest as ObserveOptions,
 };
 use super::{
     proto::{
-        BatchResponse, BlobStatusRequest, ClearProtectedRequest, CreateTempTagRequest,
-        ExportBaoRequest, ExportRangesItem, ImportBaoRequest, ImportByteStreamRequest,
-        ImportBytesRequest, ImportPathRequest, ListRequest, Scope,
+        BatchResponse, BlobBytesRequest, BlobStatusRequest, ClearProtectedRequest,
+        CreateTempTagRequest, ExportBaoRequest, ExportRangesItem, ImportBaoRequest,
+        ImportByteStreamRequest, ImportBytesRequest, ImportPathRequest, ListRequest, Scope,
     },
     remote::HashSeqChunk,
     tags::TagInfo,
@@ -369,6 +369,40 @@ impl Blobs {
         self.export_bao(hash.into(), ChunkRanges::all())
             .data_to_bytes()
             .await
+    }
+
+    /// Get multiple complete local blobs into memory.
+    ///
+    /// The store may satisfy small inlined blobs in a single local read
+    /// transaction. Complete blobs that cannot use that fast path fall back to
+    /// the same validated export path as [`Self::get_bytes`]. Missing or
+    /// partial blobs are returned as `Ok(None)` at their original index.
+    pub async fn get_bytes_many_if_complete(
+        &self,
+        hashes: impl IntoIterator<Item = Hash>,
+    ) -> RequestResult<Vec<super::Result<Option<Bytes>>>> {
+        let hashes = hashes.into_iter().collect::<Vec<_>>();
+        let results = self
+            .client
+            .rpc(BlobBytesRequest {
+                hashes: hashes.clone(),
+            })
+            .await??;
+        if results.len() != hashes.len() {
+            return Err(io::Error::other("blob bytes response length mismatch").into());
+        }
+
+        let mut out = Vec::with_capacity(results.len());
+        for (hash, result) in hashes.into_iter().zip(results) {
+            match result {
+                BlobBytesResult::Complete { data } => out.push(Ok(Some(data))),
+                BlobBytesResult::Partial { .. } | BlobBytesResult::NotFound => out.push(Ok(None)),
+                BlobBytesResult::NeedsExport { .. } => {
+                    out.push(self.get_bytes(hash).await.map(Some).map_err(Into::into));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Observe the bitfield of the given hash.
