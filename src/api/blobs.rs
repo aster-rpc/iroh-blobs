@@ -46,9 +46,10 @@ pub use super::proto::{
 };
 use super::{
     proto::{
-        BatchResponse, BlobBytesRequest, BlobStatusRequest, ClearProtectedRequest,
-        CreateTempTagRequest, ExportBaoRequest, ExportRangesItem, ImportBaoRequest,
-        ImportByteStreamRequest, ImportBytesRequest, ImportPathRequest, ListRequest, Scope,
+        BatchResponse, BlobBytesRequest, BlobStatusManyRequest, BlobStatusRequest,
+        ClearProtectedRequest, CreateTempTagRequest, ExportBaoRequest, ExportRangesItem,
+        ImportBaoRequest, ImportByteStreamRequest, ImportBytesRequest, ImportPathRequest,
+        ListRequest, Scope,
     },
     remote::HashSeqChunk,
     tags::TagInfo,
@@ -528,6 +529,15 @@ impl Blobs {
     pub async fn status(&self, hash: impl Into<Hash>) -> irpc::Result<BlobStatus> {
         let hash = hash.into();
         let msg = BlobStatusRequest { hash };
+        self.client.rpc(msg).await
+    }
+
+    pub async fn status_many(
+        &self,
+        hashes: impl IntoIterator<Item = impl Into<Hash>>,
+    ) -> irpc::Result<Vec<BlobStatus>> {
+        let hashes = hashes.into_iter().map(Into::into).collect();
+        let msg = BlobStatusManyRequest { hashes };
         self.client.rpc(msg).await
     }
 
