@@ -490,6 +490,9 @@ pub(crate) mod sink {
         }
     }
 
+    /// Kept for upstream parity: the downloader's split path now forwards root
+    /// progress to the real sink, leaving this without a caller in-tree.
+    #[allow(dead_code)]
     pub struct Drain;
 
     impl<T> Sink<T> for Drain {
