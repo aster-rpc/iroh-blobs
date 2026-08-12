@@ -3,7 +3,10 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     future::{Future, IntoFuture},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use genawaiter::sync::Gen;
@@ -27,7 +30,7 @@ use crate::{
     protocol::{GetManyRequest, GetRequest},
     util::{
         connection_pool::ConnectionPool,
-        sink::{Drain, IrpcSenderRefSink, Sink, TokioMpscSenderSink},
+        sink::{IrpcSenderRefSink, Sink, TokioMpscSenderSink},
     },
     BlobFormat, Hash, HashAndFormat,
 };
@@ -72,6 +75,15 @@ pub enum DownloadProgressItem {
         request: Arc<GetRequest>,
     },
     Progress(u64),
+    /// Payload bytes actually read from a provider during one attempt, emitted
+    /// once when that attempt ends (before its [`Self::PartComplete`] or
+    /// [`Self::ProviderFailed`]), and only when non-zero.
+    ///
+    /// Unlike [`Self::Progress`], which is a cumulative offset that includes
+    /// bytes already resident locally, these values are additive: summing them
+    /// over a download gives the exact payload transferred, including bytes
+    /// received before an attempt failed.
+    BytesTransferred(u64),
     DownloadError,
 }
 
@@ -175,7 +187,16 @@ async fn handle_download_split_impl(
     tx: &mut mpsc::Sender<DownloadProgressItem>,
 ) -> Result<()> {
     let providers = request.providers;
-    let requests = split_request(&request.request, &providers, &pool, &store, Drain).await?;
+    // The root fetch is a real provider attempt: report it like any other,
+    // instead of dropping its events into a `Drain`.
+    let requests = split_request(
+        &request.request,
+        &providers,
+        &pool,
+        &store,
+        IrpcSenderRefSink(&mut *tx),
+    )
+    .await?;
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(32);
     let mut futs = stream::iter(requests.into_iter().enumerate())
         .map(|(id, request)| {
@@ -209,6 +230,7 @@ async fn handle_download_split_impl(
                 x => x,
             })
     };
+    let mut closed = false;
     loop {
         tokio::select! {
             Some(item) = progress_stream.next() => {
@@ -226,9 +248,23 @@ async fn handle_download_split_impl(
             }
             _ = tx.closed() => {
                 // The sender has been closed, we should stop processing.
+                closed = true;
                 break;
             }
         }
+    }
+    if closed {
+        return Ok(());
+    }
+    // Every child has finished, but its last events can still be sitting in the
+    // fan-in. Drop the futures stream and the producer handle so the fan-in can
+    // terminate, then forward what is left: otherwise a final `TryProvider`,
+    // `BytesTransferred`, `ProviderFailed` or `PartComplete` is lost whenever a
+    // child completes fast enough to end `futs` first.
+    drop(futs);
+    drop(progress_tx);
+    while let Some(item) = progress_stream.next().await {
+        tx.send(item).await?;
     }
     Ok(())
 }
@@ -481,6 +517,19 @@ async fn split_request<'a>(
     })
 }
 
+/// Emit the payload total for one provider attempt, skipping the zero case.
+async fn send_bytes_transferred(
+    mut progress: impl Sink<DownloadProgressItem, Error = irpc::channel::SendError>,
+    bytes: u64,
+) -> Result<()> {
+    if bytes > 0 {
+        progress
+            .send(DownloadProgressItem::BytesTransferred(bytes))
+            .await?;
+    }
+    Ok(())
+}
+
 /// Execute a get request sequentially for multiple providers.
 ///
 /// It will try each provider in order
@@ -503,17 +552,20 @@ async fn execute_get(
     let remote = store.remote();
     let mut providers = providers.find_providers(request.content());
     while let Some(provider) = providers.next().await {
+        let conn = pool.get_or_connect(provider);
+        let local = remote.local_for_request(request.clone()).await?;
+        if local.is_complete() {
+            return Ok(());
+        }
+        // Emitted only once we know there is something left to fetch, so
+        // `TryProvider` means an actual transfer attempt rather than a no-op on
+        // already-resident content.
         progress
             .send(DownloadProgressItem::TryProvider {
                 id: provider,
                 request: request.clone(),
             })
             .await?;
-        let conn = pool.get_or_connect(provider);
-        let local = remote.local_for_request(request.clone()).await?;
-        if local.is_complete() {
-            return Ok(());
-        }
         let local_bytes = local.local_bytes();
         let Ok(conn) = conn.await else {
             progress
@@ -524,15 +576,24 @@ async fn execute_get(
                 .await?;
             continue;
         };
+        // Raw per-attempt payload counter, kept so a *failed* attempt can still
+        // report the bytes it did transfer. On success we use the exact figure
+        // from the returned stats instead of the last progress update.
+        let attempt_bytes = Arc::new(AtomicU64::new(0));
+        let attempt_counter = attempt_bytes.clone();
         match remote
             .execute_get_sink(
                 conn.clone(),
                 local.missing(),
-                (&mut progress).with_map(move |x| DownloadProgressItem::Progress(x + local_bytes)),
+                (&mut progress).with_map(move |x| {
+                    attempt_counter.store(x, Ordering::Relaxed);
+                    DownloadProgressItem::Progress(x + local_bytes)
+                }),
             )
             .await
         {
-            Ok(_stats) => {
+            Ok(stats) => {
+                send_bytes_transferred(&mut progress, stats.payload_bytes_read).await?;
                 progress
                     .send(DownloadProgressItem::PartComplete {
                         request: request.clone(),
@@ -541,6 +602,8 @@ async fn execute_get(
                 return Ok(());
             }
             Err(_cause) => {
+                send_bytes_transferred(&mut progress, attempt_bytes.load(Ordering::Relaxed))
+                    .await?;
                 progress
                     .send(DownloadProgressItem::ProviderFailed {
                         id: provider,
@@ -596,13 +659,16 @@ mod tests {
     use std::ops::Deref;
 
     use bao_tree::ChunkRanges;
+    use iroh::EndpointId;
     use n0_future::StreamExt;
     use testresult::TestResult;
 
     use crate::{
         api::{
             blobs::AddBytesOptions,
-            downloader::{DownloadOptions, Downloader, Shuffled, SplitStrategy},
+            downloader::{
+                DownloadOptions, DownloadProgressItem, Downloader, Shuffled, SplitStrategy,
+            },
         },
         hashseq::HashSeq,
         protocol::{GetManyRequest, GetRequest},
@@ -789,6 +855,205 @@ mod tests {
                 "wait_idle did not resolve within 5s — DownloaderActor JoinSet not draining"
             })??;
 
+        Ok(())
+    }
+
+    /// What a download reported, folded out of its progress stream.
+    #[derive(Default, Debug)]
+    struct Reported {
+        tried: Vec<EndpointId>,
+        failed: Vec<EndpointId>,
+        completed: usize,
+        bytes: u64,
+        errors: usize,
+    }
+
+    async fn collect(
+        mut stream: impl n0_future::Stream<Item = DownloadProgressItem> + Unpin,
+    ) -> Reported {
+        let mut out = Reported::default();
+        while let Some(item) = stream.next().await {
+            match item {
+                DownloadProgressItem::TryProvider { id, .. } => out.tried.push(id),
+                DownloadProgressItem::ProviderFailed { id, .. } => out.failed.push(id),
+                DownloadProgressItem::PartComplete { .. } => out.completed += 1,
+                DownloadProgressItem::BytesTransferred(n) => out.bytes += n,
+                DownloadProgressItem::Error(_) | DownloadProgressItem::DownloadError => {
+                    out.errors += 1
+                }
+                DownloadProgressItem::Progress(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Build a HashSeq of `children` in `store` and return (root hash, total
+    /// payload bytes of root + children).
+    async fn add_collection(
+        store: &crate::store::fs::FsStore,
+        children: &[Vec<u8>],
+    ) -> TestResult<(Hash, u64)> {
+        let mut hashes = Vec::new();
+        let mut total = 0u64;
+        for child in children {
+            hashes.push(store.add_slice(child.clone()).await?.hash);
+            total += child.len() as u64;
+        }
+        let hs = hashes.into_iter().collect::<HashSeq>();
+        let root_bytes: bytes::Bytes = hs.into();
+        total += root_bytes.len() as u64;
+        let root = store
+            .add_bytes_with_opts(AddBytesOptions {
+                data: root_bytes,
+                format: crate::BlobFormat::HashSeq,
+            })
+            .await?;
+        Ok((root.hash, total))
+    }
+
+    /// Split downloads must report the provider that served the HashSeq root
+    /// (it used to be swallowed by a `Drain` sink), and the summed
+    /// `BytesTransferred` must equal the exact payload of root + children.
+    #[tokio::test]
+    async fn downloader_split_reports_root_and_exact_bytes() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let (r1, store1, _, _) = node_test_setup_fs(testdir.path().join("a")).await?;
+        let (r2, store2, _, sp2) = node_test_setup_fs(testdir.path().join("b")).await?;
+        let children = vec![vec![1u8; 100_000], vec![2u8; 4096]];
+        let (root, expected_bytes) = add_collection(&store1, &children).await?;
+        let addr1 = r1.endpoint().addr();
+        sp2.add_endpoint_info(addr1.clone());
+        let swarm = Downloader::new(&store2, r2.endpoint());
+
+        let reported = collect(
+            swarm
+                .download_with_opts(DownloadOptions::new(
+                    GetRequest::all(root),
+                    [addr1.id],
+                    SplitStrategy::Split,
+                ))
+                .stream()
+                .await?,
+        )
+        .await;
+
+        assert_eq!(reported.errors, 0);
+        // root + both children, each attributed to the one provider.
+        assert_eq!(reported.tried, vec![addr1.id; 3]);
+        assert!(reported.failed.is_empty());
+        assert_eq!(reported.completed, 3);
+        assert_eq!(reported.bytes, expected_bytes);
+        Ok(())
+    }
+
+    /// A child that is already resident must neither be re-fetched nor reported
+    /// as a provider attempt.
+    #[tokio::test]
+    async fn downloader_split_skips_resident_child() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let (r1, store1, _, _) = node_test_setup_fs(testdir.path().join("a")).await?;
+        let (r2, store2, _, sp2) = node_test_setup_fs(testdir.path().join("b")).await?;
+        let resident = vec![1u8; 100_000];
+        let missing = vec![2u8; 4096];
+        let children = vec![resident.clone(), missing.clone()];
+        let (root, all_bytes) = add_collection(&store1, &children).await?;
+        // The consumer already holds the big child.
+        store2.add_slice(resident.clone()).await?;
+        let addr1 = r1.endpoint().addr();
+        sp2.add_endpoint_info(addr1.clone());
+        let swarm = Downloader::new(&store2, r2.endpoint());
+
+        let reported = collect(
+            swarm
+                .download_with_opts(DownloadOptions::new(
+                    GetRequest::all(root),
+                    [addr1.id],
+                    SplitStrategy::Split,
+                ))
+                .stream()
+                .await?,
+        )
+        .await;
+
+        assert_eq!(reported.errors, 0);
+        // Root + the missing child only: the resident child never dials.
+        assert_eq!(reported.tried, vec![addr1.id; 2]);
+        assert_eq!(reported.completed, 2);
+        assert_eq!(reported.bytes, all_bytes - resident.len() as u64);
+        Ok(())
+    }
+
+    /// Every completed child must be reported, including the last one to
+    /// finish. The fan-in used to be abandoned as soon as the futures stream
+    /// ended, dropping whatever was still buffered; small children make that
+    /// race likely, so this repeats with a fresh consumer each round.
+    #[tokio::test]
+    async fn downloader_split_reports_every_child_completion() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let (r1, store1, _, _) = node_test_setup_fs(testdir.path().join("a")).await?;
+        let children = (0..12u8).map(|i| vec![i; 1024]).collect::<Vec<_>>();
+        let (root, expected_bytes) = add_collection(&store1, &children).await?;
+        let addr1 = r1.endpoint().addr();
+
+        for round in 0..3 {
+            let (r2, store2, _, sp2) =
+                node_test_setup_fs(testdir.path().join(format!("consumer-{round}"))).await?;
+            sp2.add_endpoint_info(addr1.clone());
+            let swarm = Downloader::new(&store2, r2.endpoint());
+            let reported = collect(
+                swarm
+                    .download_with_opts(DownloadOptions::new(
+                        GetRequest::all(root),
+                        [addr1.id],
+                        SplitStrategy::Split,
+                    ))
+                    .stream()
+                    .await?,
+            )
+            .await;
+            assert_eq!(reported.errors, 0, "round {round}");
+            assert_eq!(reported.completed, children.len() + 1, "round {round}");
+            assert_eq!(reported.tried.len(), children.len() + 1, "round {round}");
+            assert_eq!(reported.bytes, expected_bytes, "round {round}");
+            r2.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    /// Failover across an ordered provider list is reported per request: the
+    /// provider that cannot serve is marked failed, the next one completes, and
+    /// the byte total still covers the content exactly once.
+    #[tokio::test]
+    async fn downloader_split_reports_failover() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let (r1, store1, _, _) = node_test_setup_fs(testdir.path().join("holder")).await?;
+        let (r2, _store2, _, _) = node_test_setup_fs(testdir.path().join("empty")).await?;
+        let (r3, store3, _, sp3) = node_test_setup_fs(testdir.path().join("consumer")).await?;
+        let children = vec![vec![7u8; 8192], vec![9u8; 8192]];
+        let (root, expected_bytes) = add_collection(&store1, &children).await?;
+        let holder = r1.endpoint().addr();
+        let empty = r2.endpoint().addr();
+        sp3.add_endpoint_info(holder.clone());
+        sp3.add_endpoint_info(empty.clone());
+        let swarm = Downloader::new(&store3, r3.endpoint());
+
+        let reported = collect(
+            swarm
+                .download_with_opts(DownloadOptions::new(
+                    GetRequest::all(root),
+                    [empty.id, holder.id],
+                    SplitStrategy::Split,
+                ))
+                .stream()
+                .await?,
+        )
+        .await;
+
+        assert_eq!(reported.errors, 0);
+        // Root + 2 children, each walking the list from the top.
+        assert_eq!(reported.failed, vec![empty.id; 3]);
+        assert_eq!(reported.completed, 3);
+        assert_eq!(reported.bytes, expected_bytes);
         Ok(())
     }
 }
