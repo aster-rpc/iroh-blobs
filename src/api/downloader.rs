@@ -81,13 +81,16 @@ pub enum DownloadProgressItem {
     ///
     /// Unlike [`Self::Progress`], which is a cumulative offset that includes
     /// bytes already resident locally, these values are additive: summing them
-    /// over a download gives the payload transferred, counting each byte once
-    /// across failover.
+    /// over a download gives the payload pulled off the wire.
     ///
-    /// Precisely, this counts payload bytes that were **successfully decoded**.
-    /// A partial transfer that fails part-way is counted up to its last valid
-    /// chunk; a chunk that fails verification is not counted, because the
-    /// decode error propagates before its progress update is sent.
+    /// Precisely, each value is the payload **successfully decoded** by that
+    /// attempt. A partial transfer that fails part-way is counted up to its
+    /// last valid chunk; a chunk that fails verification is not counted,
+    /// because the decode error propagates before its progress update is sent.
+    /// The sum is therefore per-attempt, not per-byte-of-content: ordinary
+    /// failover resumes from what is already stored and so counts each byte
+    /// once, but a range that was decoded and then failed to import locally is
+    /// re-fetched and counted again.
     BytesTransferred(u64),
     DownloadError,
 }
@@ -985,6 +988,16 @@ mod tests {
             );
             high = *offset;
         }
+        // Monotonicity alone would also hold if progress stopped being reported
+        // at all, so pin that it is still emitted and still lands on the child
+        // aggregate total (the root is reported through `BytesTransferred`, not
+        // through this counter).
+        let children_total: u64 = children.iter().map(|c| c.len() as u64).sum();
+        assert_eq!(
+            offsets.last().copied(),
+            Some(children_total),
+            "final offset should be the child total: {offsets:?}"
+        );
         Ok(())
     }
 
