@@ -81,8 +81,13 @@ pub enum DownloadProgressItem {
     ///
     /// Unlike [`Self::Progress`], which is a cumulative offset that includes
     /// bytes already resident locally, these values are additive: summing them
-    /// over a download gives the exact payload transferred, including bytes
-    /// received before an attempt failed.
+    /// over a download gives the payload transferred, counting each byte once
+    /// across failover.
+    ///
+    /// Precisely, this counts payload bytes that were **successfully decoded**.
+    /// A partial transfer that fails part-way is counted up to its last valid
+    /// chunk; a chunk that fails verification is not counted, because the
+    /// decode error propagates before its progress update is sent.
     BytesTransferred(u64),
     DownloadError,
 }
@@ -180,6 +185,30 @@ async fn handle_download_impl(
     Ok(())
 }
 
+/// Forwards every progress item from the split path's root fetch except the
+/// legacy cumulative [`DownloadProgressItem::Progress`] offset.
+///
+/// Split mode runs two independent `Progress` counters: the root fetch's, and
+/// the child aggregator's, which sums the latest per-child offset and knows
+/// nothing about the root. Forwarding both makes the offset jump backwards the
+/// moment the first child reports — a 384-byte root followed by `Progress(1)`.
+/// Dropping the root's offsets keeps the counter monotonic and matches what
+/// consumers saw before the root was reported at all. Provider attribution and
+/// the additive `BytesTransferred` totals still flow through, so no accounting
+/// is lost.
+struct RootProgressFilter<'a>(&'a mut mpsc::Sender<DownloadProgressItem>);
+
+impl Sink<DownloadProgressItem> for RootProgressFilter<'_> {
+    type Error = irpc::channel::SendError;
+
+    async fn send(&mut self, value: DownloadProgressItem) -> std::result::Result<(), Self::Error> {
+        if matches!(value, DownloadProgressItem::Progress(_)) {
+            return Ok(());
+        }
+        self.0.send(value).await
+    }
+}
+
 async fn handle_download_split_impl(
     store: Store,
     pool: ConnectionPool,
@@ -188,13 +217,14 @@ async fn handle_download_split_impl(
 ) -> Result<()> {
     let providers = request.providers;
     // The root fetch is a real provider attempt: report it like any other,
-    // instead of dropping its events into a `Drain`.
+    // instead of dropping its events into a `Drain`. Its legacy `Progress`
+    // offsets are the exception — see [`RootProgressFilter`].
     let requests = split_request(
         &request.request,
         &providers,
         &pool,
         &store,
-        IrpcSenderRefSink(&mut *tx),
+        RootProgressFilter(&mut *tx),
     )
     .await?;
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(32);
@@ -658,7 +688,7 @@ impl ContentDiscovery for Shuffled {
 mod tests {
     use std::ops::Deref;
 
-    use bao_tree::ChunkRanges;
+    use bao_tree::{ChunkNum, ChunkRanges};
     use iroh::EndpointId;
     use n0_future::StreamExt;
     use testresult::TestResult;
@@ -673,7 +703,7 @@ mod tests {
         hashseq::HashSeq,
         protocol::{GetManyRequest, GetRequest},
         tests::node_test_setup_fs,
-        Hash,
+        Hash, HashAndFormat,
     };
 
     #[tokio::test]
@@ -911,6 +941,53 @@ mod tests {
         Ok((root.hash, total))
     }
 
+    /// `Progress` is a cumulative offset that consumers render as a bar, so it
+    /// must never go backwards.
+    ///
+    /// In `Split` mode the root fetch and the child aggregation are separate
+    /// counters — the aggregator sums the latest per-child offset and knows
+    /// nothing about the root — so forwarding both emits the root's total and
+    /// then restarts from the first child's offset.
+    #[tokio::test]
+    async fn downloader_split_progress_is_monotonic() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let (r1, store1, _, _) = node_test_setup_fs(testdir.path().join("a")).await?;
+        let (r2, store2, _, sp2) = node_test_setup_fs(testdir.path().join("b")).await?;
+        // Twelve one-byte children: the root is 12 * 32 bytes of hashes, far
+        // larger than any child, so a root offset reaching the child counter
+        // shows up as a backwards jump.
+        let children = (0..12u8).map(|i| vec![i; 1]).collect::<Vec<_>>();
+        let (root, _) = add_collection(&store1, &children).await?;
+        let addr1 = r1.endpoint().addr();
+        sp2.add_endpoint_info(addr1.clone());
+        let swarm = Downloader::new(&store2, r2.endpoint());
+
+        let mut stream = swarm
+            .download_with_opts(DownloadOptions::new(
+                GetRequest::all(root),
+                [addr1.id],
+                SplitStrategy::Split,
+            ))
+            .stream()
+            .await?;
+        let mut offsets = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let DownloadProgressItem::Progress(offset) = item {
+                offsets.push(offset);
+            }
+        }
+
+        let mut high = 0;
+        for (i, offset) in offsets.iter().enumerate() {
+            assert!(
+                *offset >= high,
+                "progress went backwards at index {i}: {offsets:?}"
+            );
+            high = *offset;
+        }
+        Ok(())
+    }
+
     /// Split downloads must report the provider that served the HashSeq root
     /// (it used to be swallowed by a `Drain` sink), and the summed
     /// `BytesTransferred` must equal the exact payload of root + children.
@@ -1017,6 +1094,67 @@ mod tests {
             assert_eq!(reported.bytes, expected_bytes, "round {round}");
             r2.shutdown().await?;
         }
+        Ok(())
+    }
+
+    /// A provider holding only part of a blob transfers what it has and then
+    /// fails. Those bytes must still be counted, and the next provider must be
+    /// asked only for the remainder.
+    #[tokio::test]
+    async fn downloader_counts_bytes_from_a_partial_provider() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let (r1, store1, _, _) = node_test_setup_fs(testdir.path().join("holder")).await?;
+        let (r2, store2, _, sp2) = node_test_setup_fs(testdir.path().join("partial")).await?;
+        let (r3, store3, _, sp3) = node_test_setup_fs(testdir.path().join("consumer")).await?;
+        let data = vec![42u8; 1024 * 1024];
+        let tt = store1.add_slice(data.clone()).await?;
+        let holder = r1.endpoint().addr();
+        let partial = r2.endpoint().addr();
+        sp2.add_endpoint_info(holder.clone());
+        sp3.add_endpoint_info(holder.clone());
+        sp3.add_endpoint_info(partial.clone());
+
+        // `partial` fetches only the first 8 chunks, leaving an incomplete blob.
+        let conn = r2.endpoint().connect(holder.clone(), crate::ALPN).await?;
+        store2
+            .remote()
+            .execute_get(
+                conn,
+                GetRequest::builder()
+                    .root(ChunkRanges::from(..ChunkNum(8)))
+                    .build(tt.hash),
+            )
+            .await?;
+        let held = store2
+            .remote()
+            .local(HashAndFormat::raw(tt.hash))
+            .await?
+            .local_bytes();
+        assert!(held > 0 && held < data.len() as u64, "held {held} bytes");
+
+        let swarm = Downloader::new(&store3, r3.endpoint());
+        let reported = collect(
+            swarm
+                .download_with_opts(DownloadOptions::new(
+                    tt.hash,
+                    [partial.id, holder.id],
+                    SplitStrategy::None,
+                ))
+                .stream()
+                .await?,
+        )
+        .await;
+
+        assert_eq!(reported.errors, 0);
+        assert_eq!(reported.failed, vec![partial.id]);
+        assert_eq!(reported.tried, vec![partial.id, holder.id]);
+        assert_eq!(store3.get_bytes(tt.hash).await?.deref(), data.as_slice());
+        assert_eq!(
+            reported.bytes,
+            data.len() as u64,
+            "partial provider {held}, total {}",
+            data.len()
+        );
         Ok(())
     }
 
