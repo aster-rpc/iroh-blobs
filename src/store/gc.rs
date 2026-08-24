@@ -67,7 +67,17 @@ pub(super) async fn gc_mark_task(
     }
     for HashAndFormat { hash, format } in roots {
         // we need to do this for all formats except raw
-        if live.insert(hash) && !format.is_raw() {
+        // Insert and traverse are SEPARATE decisions. `HashAndFormat`'s
+        // identity includes the format, so the roots can hold both (H, Raw)
+        // and (H, HashSeq) — and H may already be live through external
+        // protection or another collection's membership. Joining traversal to
+        // `live.insert(hash)` made a collection walk conditional on the ROOT
+        // HASH being novel: an aliased or pre-live HashSeq root was never
+        // traversed, its children went unmarked (swept if complete), and an
+        // incomplete root emitted no `TraversalIncomplete`, silently
+        // bypassing the sweep suppression.
+        let _ = live.insert(hash);
+        if !format.is_raw() {
             let mut stream = store.export_bao(hash, ChunkRanges::all()).hashes();
             while let Some(child) = stream.next().await {
                 match child {
@@ -832,6 +842,130 @@ mod tests {
         tracing_subscriber::fmt::try_init().ok();
         let store = crate::store::mem::MemStore::new();
         late_root_hash_seq_claim_survives_the_sweep(&store).await
+    }
+
+    /// Mark must traverse a HashSeq root even when its HASH is already live.
+    ///
+    /// `HashAndFormat` identity includes the format, so (H, Raw) and
+    /// (H, HashSeq) are distinct roots over one hash — and H can be live
+    /// before the collection root is visited (external protection, an aliased
+    /// raw claim, or membership in another collection). Traversal joined to
+    /// `live.insert(H)` skipped the walk in all of those: complete children
+    /// went unmarked and were swept; an incomplete root emitted no
+    /// `TraversalIncomplete`, bypassing the sweep suppression. The
+    /// pre-seeded-`live` stagings here fail deterministically under the
+    /// joined condition, independent of root-set iteration order.
+    async fn already_live_hash_seq_root_is_still_traversed(store: &Store) -> TestResult<()> {
+        use crate::{api::blobs::AddBytesOptions, hashseq::HashSeq, BlobFormat};
+        let blobs = store.blobs();
+
+        let mk_child = |data: &'static [u8]| async move {
+            let tt = blobs.add_slice(data).temp_tag().await?;
+            let hash = tt.hash();
+            drop(tt);
+            TestResult::<Hash>::Ok(hash)
+        };
+
+        // (A) A COMPLETE collection whose root hash is externally protected
+        // (pre-seeded into `live`): its children must still be marked.
+        let a = mk_child(b"aliased child a").await?;
+        let b = mk_child(b"aliased child b").await?;
+        let seq_ab: HashSeq = [a, b].into_iter().collect();
+        let root_ab = {
+            let tt = blobs
+                .add_bytes_with_opts(AddBytesOptions {
+                    data: seq_ab.into(),
+                    format: BlobFormat::HashSeq,
+                })
+                .temp_tag()
+                .await?;
+            let hash = tt.hash();
+            drop(tt);
+            hash
+        };
+        store
+            .tags()
+            .set("aliased-seq", HashAndFormat::hash_seq(root_ab))
+            .await?;
+
+        let mut live = HashSet::new();
+        live.insert(root_ab); // externally protected BEFORE the mark visits the root
+        gc_run_once(store, &mut live).await?;
+        assert_eq!(
+            store.get_bytes(a).await?.as_ref(),
+            b"aliased child a",
+            "an already-live HashSeq root was not traversed and its child was swept",
+        );
+        assert_eq!(store.get_bytes(b).await?.as_ref(), b"aliased child b");
+        assert!(store.get_bytes(root_ab).await.is_ok());
+
+        // (B) The same hash claimed as BOTH Raw and HashSeq keeps its
+        // children regardless of which form the root-set iteration meets
+        // first.
+        store
+            .tags()
+            .set("aliased-raw", HashAndFormat::raw(root_ab))
+            .await?;
+        let mut live2 = HashSet::new();
+        gc_run_once(store, &mut live2).await?;
+        assert!(store.get_bytes(a).await.is_ok());
+        assert!(store.get_bytes(b).await.is_ok());
+
+        // Dropping the HashSeq claim while the raw claim stays: the children
+        // are no longer held (the raw form pins only the root's bytes).
+        store.tags().delete("aliased-seq").await?;
+        let mut live3 = HashSet::new();
+        gc_run_once(store, &mut live3).await?;
+        assert!(store.get_bytes(root_ab).await.is_ok());
+        assert!(store.get_bytes(a).await.is_err());
+        assert!(store.get_bytes(b).await.is_err());
+        store.tags().delete("aliased-raw").await?;
+
+        // (C) An already-live but ABSENT HashSeq root must still suppress the
+        // sweep: the mark cannot bound the claimed collection even though the
+        // root hash was not novel.
+        let c = mk_child(b"aliased child c").await?;
+        let d = mk_child(b"aliased child d").await?;
+        let seq_cd: HashSeq = [c, d].into_iter().collect();
+        let bytes_cd: bytes::Bytes = seq_cd.into();
+        let root_cd = Hash::new(&bytes_cd); // never imported
+        store
+            .tags()
+            .set("aliased-absent-seq", HashAndFormat::hash_seq(root_cd))
+            .await?;
+        let mut live4 = HashSet::new();
+        live4.insert(root_cd); // externally protected: the root hash is not novel
+        gc_run_once(store, &mut live4).await?;
+        assert!(
+            store.get_bytes(c).await.is_ok(),
+            "an already-live absent HashSeq root did not suppress the sweep",
+        );
+        assert!(store.get_bytes(d).await.is_ok());
+
+        // Releasing the unresolvable claim lets GC reclaim everything.
+        store.tags().delete("aliased-absent-seq").await?;
+        let mut live5 = HashSet::new();
+        gc_run_once(store, &mut live5).await?;
+        assert!(store.get_bytes(root_ab).await.is_err());
+        assert!(store.get_bytes(c).await.is_err());
+        assert!(store.get_bytes(d).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "fs-store")]
+    async fn already_live_hash_seq_root_is_still_traversed_fs() -> TestResult {
+        tracing_subscriber::fmt::try_init().ok();
+        let testdir = tempfile::tempdir()?;
+        let store = crate::store::fs::FsStore::load(testdir.path().join("db")).await?;
+        already_live_hash_seq_root_is_still_traversed(&store).await
+    }
+
+    #[tokio::test]
+    async fn already_live_hash_seq_root_is_still_traversed_mem() -> TestResult {
+        tracing_subscriber::fmt::try_init().ok();
+        let store = crate::store::mem::MemStore::new();
+        already_live_hash_seq_root_is_still_traversed(&store).await
     }
 
     async fn gc_check_deletion(store: &Store) -> TestResult {
