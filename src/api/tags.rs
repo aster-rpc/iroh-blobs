@@ -60,6 +60,12 @@ impl Tags {
 
     pub async fn set_with_opts(&self, options: SetOptions) -> super::RequestResult<()> {
         trace!("{:?}", options);
+        // A non-raw tag's children must join the in-flight sweep's protection
+        // BEFORE the tag is acknowledged (the store protects the root when it
+        // inserts the tag; the children have nothing else pinning them against
+        // a sweep whose mark predates this call). Fails closed: a tag whose
+        // custody cannot be established is refused, not half-kept.
+        super::blobs::expand_custody(&self.client, options.value).await?;
         self.client.rpc(options).await??;
         Ok(())
     }
@@ -181,6 +187,8 @@ impl Tags {
 
     pub async fn create_with_opts(&self, options: CreateOptions) -> super::RequestResult<Tag> {
         trace!("{:?}", options);
+        // Same custody expansion as `set_with_opts`, same ordering.
+        super::blobs::expand_custody(&self.client, options.value).await?;
         let rx = self.client.rpc(options);
         Ok(rx.await??)
     }
@@ -192,12 +200,15 @@ impl Tags {
         .await
     }
 
-    pub async fn temp_tag(&self, value: impl Into<HashAndFormat>) -> irpc::Result<TempTag> {
+    pub async fn temp_tag(&self, value: impl Into<HashAndFormat>) -> super::RequestResult<TempTag> {
         let value = value.into();
         let msg = CreateTempTagRequest {
             scope: Scope::GLOBAL,
             value,
         };
-        self.client.rpc(msg).await
+        let tt = self.client.rpc(msg).await?;
+        // Same custody expansion as `Batch::temp_tag`, same ordering.
+        super::blobs::expand_custody(&self.client, value).await?;
+        Ok(tt)
     }
 }

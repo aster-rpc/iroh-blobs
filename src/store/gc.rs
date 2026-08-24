@@ -518,6 +518,131 @@ mod tests {
         tag_after_mark_survives_the_sweep(&store).await
     }
 
+    /// The HashSeq form of the same claim: a collection tag created between a
+    /// sweep's mark and its delete must protect the ROOT AND EVERY CHILD.
+    ///
+    /// The root is pinned by the tag itself; the children are only reachable
+    /// through the root's bytes, which the stale mark never traversed (the tag
+    /// did not exist yet). Custody expansion at tag creation is what joins
+    /// them to the in-flight sweep's protection — and a temp-only HashSeq tag
+    /// must protect at least its root (`TempTags::contains` was raw-only).
+    async fn hash_seq_tag_after_mark_survives_the_sweep(store: &Store) -> TestResult<()> {
+        use crate::{api::blobs::AddBytesOptions, hashseq::HashSeq, BlobFormat};
+        let blobs = store.blobs();
+
+        // Two collections, each with two resident children: one claimed by a
+        // batch temp tag, one by a bare persistent tag. Everything resident
+        // and unreferenced before mark.
+        let mk_child = |data: &'static [u8]| async move {
+            let tt = blobs.add_slice(data).temp_tag().await?;
+            let hash = tt.hash();
+            drop(tt);
+            TestResult::<Hash>::Ok(hash)
+        };
+        let a = mk_child(b"child a").await?;
+        let b = mk_child(b"child b").await?;
+        let c = mk_child(b"child c").await?;
+        let d = mk_child(b"child d").await?;
+        let mk_seq = |children: [Hash; 2]| async move {
+            let seq: HashSeq = children.into_iter().collect();
+            let tt = blobs
+                .add_bytes_with_opts(AddBytesOptions {
+                    data: seq.into(),
+                    format: BlobFormat::HashSeq,
+                })
+                .temp_tag()
+                .await?;
+            let hash = tt.hash();
+            drop(tt);
+            TestResult::<Hash>::Ok(hash)
+        };
+        let guarded_root = mk_seq([a, b]).await?;
+        let tagged_root = mk_seq([c, d]).await?;
+
+        // The sweep's mark runs before any claim exists.
+        store.blobs().clear_protected().await?;
+        let mut live = HashSet::new();
+        {
+            let mut mark = gc_mark(store, &mut live);
+            while let Some(ev) = mark.next().await {
+                if let GcMarkEvent::Error(e) = ev {
+                    return Err(e.into());
+                }
+            }
+        }
+        for h in [guarded_root, tagged_root, a, b, c, d] {
+            assert!(!live.contains(&h));
+        }
+
+        // The claims land after mark: a temp guard on one collection, a bare
+        // persistent tag on the other.
+        let batch = blobs.batch().await?;
+        let guard = batch
+            .temp_tag(HashAndFormat::hash_seq(guarded_root))
+            .await?;
+        store
+            .tags()
+            .set("claimed-seq", HashAndFormat::hash_seq(tagged_root))
+            .await?;
+
+        // The same sweep's delete phase runs with its stale live set.
+        {
+            let mut sweep = gc_sweep(store, &live);
+            while let Some(ev) = sweep.next().await {
+                if let GcSweepEvent::Error(e) = ev {
+                    return Err(e.into());
+                }
+            }
+        }
+        drop(guard);
+        drop(batch);
+
+        // Roots AND children survived.
+        assert_eq!(store.get_bytes(a).await?.as_ref(), b"child a");
+        assert_eq!(store.get_bytes(b).await?.as_ref(), b"child b");
+        assert_eq!(store.get_bytes(c).await?.as_ref(), b"child c");
+        assert_eq!(store.get_bytes(d).await?.as_ref(), b"child d");
+        assert!(store.get_bytes(guarded_root).await.is_ok());
+        assert!(store.get_bytes(tagged_root).await.is_ok());
+
+        // An ordinary next cycle still respects the persistent tag's whole
+        // collection (fresh mark traverses it), while the released temp
+        // guard's collection is reclaimed.
+        let mut live2 = HashSet::new();
+        gc_run_once(store, &mut live2).await?;
+        assert!(store.get_bytes(c).await.is_ok());
+        assert!(store.get_bytes(d).await.is_ok());
+        assert!(store.get_bytes(guarded_root).await.is_err());
+        assert!(store.get_bytes(a).await.is_err());
+        assert!(store.get_bytes(b).await.is_err());
+
+        // Releasing the persistent tag reclaims its collection too: the
+        // expansion never outlives the tag past the next cycle.
+        store.tags().delete("claimed-seq").await?;
+        let mut live3 = HashSet::new();
+        gc_run_once(store, &mut live3).await?;
+        assert!(store.get_bytes(tagged_root).await.is_err());
+        assert!(store.get_bytes(c).await.is_err());
+        assert!(store.get_bytes(d).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "fs-store")]
+    async fn hash_seq_tag_after_mark_survives_the_sweep_fs() -> TestResult {
+        tracing_subscriber::fmt::try_init().ok();
+        let testdir = tempfile::tempdir()?;
+        let store = crate::store::fs::FsStore::load(testdir.path().join("db")).await?;
+        hash_seq_tag_after_mark_survives_the_sweep(&store).await
+    }
+
+    #[tokio::test]
+    async fn hash_seq_tag_after_mark_survives_the_sweep_mem() -> TestResult {
+        tracing_subscriber::fmt::try_init().ok();
+        let store = crate::store::mem::MemStore::new();
+        hash_seq_tag_after_mark_survives_the_sweep(&store).await
+    }
+
     async fn gc_check_deletion(store: &Store) -> TestResult {
         let temp_tag = store.add_bytes(b"foo".to_vec()).temp_tag().await?;
         let hash = temp_tag.hash();

@@ -159,6 +159,11 @@ impl Actor {
             Command::ClearProtected(cmd) => {
                 cmd.tx.send(Ok(())).await.ok();
             }
+            Command::AddProtected(cmd) => {
+                // Read-only store: nothing is ever deleted, so protection is
+                // trivially satisfied.
+                cmd.tx.send(Ok(())).await.ok();
+            }
             Command::CreateTag(cmd) => {
                 cmd.tx
                     .send(Err(unsupported("create tag not supported").into()))

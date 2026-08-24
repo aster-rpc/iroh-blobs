@@ -47,7 +47,8 @@ pub use super::proto::{
 use super::{
     proto::{
         BatchResponse, BlobBytesRequest, BlobStatusManyRequest, BlobStatusRequest,
-        ClearProtectedRequest, CreateTempTagRequest, ExportBaoRequest, ExportRangesItem,
+        AddProtectedRequest, ClearProtectedRequest, CreateTempTagRequest, ExportBaoRequest,
+        ExportRangesItem,
         ImportBaoRequest, ImportByteStreamRequest, ImportBytesRequest, ImportPathRequest,
         ListRequest, Scope,
     },
@@ -571,6 +572,61 @@ impl Blobs {
         self.client.rpc(msg).await??;
         Ok(())
     }
+
+    /// Add hashes to the protection set an in-flight GC sweep consults.
+    /// Cleared at every mark, so this never outlives the next GC cycle.
+    pub(crate) async fn add_protected(&self, hashes: Vec<Hash>) -> RequestResult<()> {
+        let msg = AddProtectedRequest { hashes };
+        self.client.rpc(msg).await??;
+        Ok(())
+    }
+}
+
+/// Expand a non-raw custody claim into the active protection set **before**
+/// the claim is acknowledged to the caller.
+///
+/// A tag — temp or persistent — on a HashSeq protects the whole collection,
+/// but an in-flight sweep's delete phase consults only the live protection
+/// set, and the mark that built its live set may predate the tag. The root is
+/// pinned by the tag itself (temp tags via the delete filter, persistent tags
+/// via the store's own insert); the children have nothing pinning them, so
+/// they are expanded here:
+///
+/// - a **complete** root is read and parsed, and every child joins the
+///   protection set; a complete root that cannot be read or parsed FAILS the
+///   claim — acknowledging custody that cannot be established would be the
+///   silent-loss bug this exists to close;
+/// - an **absent or partial** root has no established collection to lose:
+///   only the root is protected, content arriving mid-sweep protects itself
+///   through the write path, and the next mark traverses the tag properly.
+pub(crate) async fn expand_custody(client: &ApiClient, value: HashAndFormat) -> RequestResult<()> {
+    let blobs = Blobs::ref_from_sender(client);
+    if value.format.is_raw() {
+        blobs.add_protected(vec![value.hash]).await?;
+        return Ok(());
+    }
+    let mut protect = vec![value.hash];
+    match blobs.status(value.hash).await? {
+        BlobStatus::Complete { .. } => {
+            let bytes = blobs.get_bytes(value.hash).await.map_err(|e| {
+                super::RequestError::from(io::Error::other(format!(
+                    "cannot establish custody of hash-seq {}: the complete root failed to \
+                     read: {e}",
+                    value.hash.to_hex(),
+                )))
+            })?;
+            let seq = crate::hashseq::HashSeq::try_from(bytes).map_err(|e| {
+                super::RequestError::from(io::Error::other(format!(
+                    "cannot establish custody of hash-seq {}: the complete root failed to \
+                     parse: {e}",
+                    value.hash.to_hex(),
+                )))
+            })?;
+            protect.extend(seq);
+        }
+        BlobStatus::NotFound | BlobStatus::Partial { .. } => {}
+    }
+    blobs.add_protected(protect).await
 }
 
 /// A progress handle for a batch scoped add operation.
@@ -685,13 +741,19 @@ impl<'a> Batch<'a> {
     /// the batch is dropped. This is the recommended way to protect a blob
     /// during a long-running write or download where GC might otherwise collect
     /// the partially-written data.
-    pub async fn temp_tag(&self, value: impl Into<HashAndFormat>) -> irpc::Result<TempTag> {
+    pub async fn temp_tag(&self, value: impl Into<HashAndFormat>) -> RequestResult<TempTag> {
         let value = value.into();
         let msg = CreateTempTagRequest {
             scope: self.scope,
             value,
         };
-        self.blobs.client.rpc(msg).await
+        let tt = self.blobs.client.rpc(msg).await?;
+        // The guard pins the root; a non-raw claim's children must join the
+        // in-flight sweep's protection before the caller is told custody
+        // exists. On failure the guard drops with this error and nothing was
+        // acknowledged.
+        expand_custody(&self.blobs.client, value).await?;
+        Ok(tt)
     }
 }
 
@@ -737,10 +799,17 @@ impl<'a> AddProgress<'a> {
     }
 
     pub async fn temp_tag(self) -> RequestResult<TempTag> {
+        let client = self.blobs.client.clone();
         let mut stream = self.inner;
         while let Some(item) = stream.next().await {
             match item {
-                AddProgressItem::Done(tt) => return Ok(tt),
+                AddProgressItem::Done(tt) => {
+                    // An imported HashSeq's children can pre-date the import
+                    // and an in-flight sweep's mark; join them to its
+                    // protection before acknowledging the guard.
+                    expand_custody(&client, tt.hash_and_format()).await?;
+                    return Ok(tt);
+                }
                 AddProgressItem::Error(e) => return Err(e.into()),
                 _ => {}
             }

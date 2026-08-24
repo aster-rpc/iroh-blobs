@@ -201,9 +201,14 @@ impl TempTags {
     }
 
     pub fn contains(&self, hash: Hash) -> bool {
-        self.scopes
-            .values()
-            .any(|scope| scope.0.lock().unwrap().contains(&HashAndFormat::raw(hash)))
+        // A temp tag pins its root hash whatever the format: a HashSeq guard
+        // that only counted as protection under `raw` left its own root
+        // deletable by an in-flight sweep.
+        self.scopes.values().any(|scope| {
+            let guard = scope.0.lock().unwrap();
+            guard.contains(&HashAndFormat::raw(hash))
+                || guard.contains(&HashAndFormat::hash_seq(hash))
+        })
     }
 }
 

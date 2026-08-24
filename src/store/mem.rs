@@ -483,6 +483,10 @@ impl Actor {
                 self.protected.clear();
                 cmd.tx.send(Ok(())).await.ok();
             }
+            Command::AddProtected(cmd) => {
+                self.protected.extend(cmd.inner.hashes.iter().copied());
+                cmd.tx.send(Ok(())).await.ok();
+            }
             Command::ExportRanges(cmd) => {
                 let entry = self.get(&cmd.hash);
                 self.spawn(export_ranges(cmd, entry));

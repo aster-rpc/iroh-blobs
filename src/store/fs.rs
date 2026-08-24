@@ -499,6 +499,10 @@ impl Actor {
                 trace!("{cmd:?}");
                 self.db().send(cmd.into()).await.ok();
             }
+            Command::AddProtected(cmd) => {
+                trace!("{cmd:?}");
+                self.db().send(cmd.into()).await.ok();
+            }
             Command::ClearProtected(cmd) => {
                 trace!("{cmd:?}");
                 self.db().send(cmd.into()).await.ok();

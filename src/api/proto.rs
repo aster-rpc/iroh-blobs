@@ -140,6 +140,8 @@ pub enum Request {
     Shutdown(ShutdownRequest),
     #[rpc(tx = oneshot::Sender<super::Result<()>>)]
     ClearProtected(ClearProtectedRequest),
+    #[rpc(tx = oneshot::Sender<super::Result<()>>)]
+    AddProtected(AddProtectedRequest),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -153,6 +155,15 @@ pub struct ShutdownRequest;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClearProtectedRequest;
+
+/// Add hashes to the protection set an in-flight GC sweep's delete phase
+/// consults. Cleared at every mark ([`ClearProtectedRequest`]), so protection
+/// added here never outlives the next GC cycle — by then the mark has
+/// re-snapshotted the tags that justified it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddProtectedRequest {
+    pub hashes: Vec<Hash>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BlobStatusRequest {
