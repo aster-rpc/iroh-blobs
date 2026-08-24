@@ -515,8 +515,19 @@ impl Actor {
                 trace!("{cmd:?}");
                 self.db().send(cmd.into()).await.ok();
             }
-            Command::DeleteBlobs(cmd) => {
+            Command::DeleteBlobs(mut cmd) => {
                 trace!("{cmd:?}");
+                // A live temp tag must protect its hash against a delete that
+                // was decided before the tag existed — the GC sweep's batch,
+                // whose mark snapshotted the temp roots earlier. Temp tags
+                // live in this actor, and so does this dispatch, so filtering
+                // here linearizes tag creation against the sweep: a guard
+                // returned to the caller is visible to every later delete.
+                // Force deletes are explicit user intent and pass through.
+                if !cmd.inner.force {
+                    let temp_tags = &self.temp_tags;
+                    cmd.inner.hashes.retain(|hash| !temp_tags.contains(*hash));
+                }
                 self.db().send(cmd.into()).await.ok();
             }
             Command::ListBlobs(cmd) => {

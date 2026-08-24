@@ -325,6 +325,10 @@ impl Actor {
                 tx,
                 ..
             }) => {
+                // The new tag joins the in-flight sweep's protection: deletion
+                // consults `protected` live, so a tag set after mark still
+                // holds through that sweep. The next mark clears the set.
+                let _ = self.protected.insert(value.hash);
                 self.state.tags.insert(tag, value);
                 tx.send(Ok(())).await.ok();
             }
@@ -334,6 +338,7 @@ impl Actor {
                 ..
             }) => {
                 let tag = Tag::auto(SystemTime::now(), |tag| self.state.tags.contains_key(tag));
+                let _ = self.protected.insert(value.hash);
                 self.state.tags.insert(tag.clone(), value);
                 tx.send(Ok(tag)).await.ok();
             }
@@ -457,7 +462,12 @@ impl Actor {
                     ..
                 } = cmd;
                 for hash in hashes {
-                    if !force && self.protected.contains(&hash) {
+                    // A live temp tag or a protected hash blocks a non-force
+                    // delete even when the deciding mark predates them — the
+                    // in-flight-sweep linearization (see the fs store's
+                    // DeleteBlobs filter and set_tag for the two halves).
+                    if !force && (self.protected.contains(&hash) || self.temp_tags.contains(hash))
+                    {
                         continue;
                     }
                     self.state.data.remove(&hash);

@@ -707,13 +707,24 @@ impl Actor {
         Ok(())
     }
 
-    async fn set_tag(tables: &mut Tables<'_>, cmd: SetTagMsg) -> ActorResult<()> {
+    async fn set_tag(
+        tables: &mut Tables<'_>,
+        protected: &mut HashSet<Hash>,
+        cmd: SetTagMsg,
+    ) -> ActorResult<()> {
         trace!("{cmd:?}");
         let SetTagMsg {
             inner: SetTagRequest { name: tag, value },
             tx,
             ..
         } = cmd;
+        // The new tag must protect its hash against a delete decided before
+        // the tag existed — a GC sweep whose mark snapshotted the tags table
+        // earlier. Deletion consults this set live, and this actor owns both,
+        // so inserting here linearizes tag creation against the sweep. The
+        // next mark clears the set and re-snapshots the tags, so protection
+        // does not outlive the tag.
+        let _ = protected.insert(value.hash);
         let res = tables
             .tags
             .insert(tag, value)
@@ -723,13 +734,20 @@ impl Actor {
         Ok(())
     }
 
-    async fn create_tag(tables: &mut Tables<'_>, cmd: CreateTagMsg) -> ActorResult<()> {
+    async fn create_tag(
+        tables: &mut Tables<'_>,
+        protected: &mut HashSet<Hash>,
+        cmd: CreateTagMsg,
+    ) -> ActorResult<()> {
         trace!("{cmd:?}");
         let CreateTagMsg {
             inner: CreateTagRequest { value },
             tx,
             ..
         } = cmd;
+        // Same linearization as `set_tag`: the auto tag must protect its hash
+        // against an in-flight sweep whose mark predates it.
+        let _ = protected.insert(value.hash);
         let tag = {
             let tag = Tag::auto(SystemTime::now(), |x| {
                 matches!(tables.tags.get(Tag(Bytes::copy_from_slice(x))), Ok(Some(_)))
@@ -801,8 +819,8 @@ impl Actor {
             ReadWriteCommand::Update(cmd) => handle_update(cmd, protected, tables),
             ReadWriteCommand::Set(cmd) => handle_set(cmd, protected, tables),
             ReadWriteCommand::DeleteBlobw(cmd) => Self::delete(protected, tables, cmd).await,
-            ReadWriteCommand::SetTag(cmd) => Self::set_tag(tables, cmd).await,
-            ReadWriteCommand::CreateTag(cmd) => Self::create_tag(tables, cmd).await,
+            ReadWriteCommand::SetTag(cmd) => Self::set_tag(tables, protected, cmd).await,
+            ReadWriteCommand::CreateTag(cmd) => Self::create_tag(tables, protected, cmd).await,
             ReadWriteCommand::DeleteTags(cmd) => Self::delete_tags(tables, cmd).await,
             ReadWriteCommand::RenameTag(cmd) => Self::rename_tag(tables, cmd).await,
             ReadWriteCommand::ProcessExit(cmd) => {

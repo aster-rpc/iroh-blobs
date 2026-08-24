@@ -411,6 +411,113 @@ mod tests {
         gc_check_deletion(&store).await
     }
 
+    /// A tag created between a sweep's mark and its delete must protect the
+    /// blob it names.
+    ///
+    /// `gc_mark` snapshots the tags table and the temp roots; the delete phase
+    /// re-checks only the store's protected set. A blob that was resident and
+    /// unreferenced when mark ran, then claimed while the sweep was still in
+    /// flight — a batch temp tag, a persistent tag, or both, which is exactly
+    /// the already-local promotion order a caller is documented to use — was
+    /// deleted by that same sweep, leaving a dangling tag over lost content.
+    /// Tag creation must join the in-flight sweep's protection instead.
+    async fn tag_after_mark_survives_the_sweep(store: &Store) -> TestResult<()> {
+        let blobs = store.blobs();
+
+        // Two resident, unreferenced blobs: one will be claimed under a temp
+        // guard then promoted, one by a bare persistent tag.
+        let guarded_data = b"claimed under a live batch guard".to_vec();
+        let tagged_data = b"claimed by a bare persistent tag".to_vec();
+        let t1 = blobs.add_slice(&guarded_data).temp_tag().await?;
+        let guarded = t1.hash();
+        drop(t1);
+        let t2 = blobs.add_slice(&tagged_data).temp_tag().await?;
+        let tagged = t2.hash();
+        drop(t2);
+
+        // The sweep's mark runs first: no roots, so neither hash is live.
+        store.blobs().clear_protected().await?;
+        let mut live = HashSet::new();
+        {
+            let mut mark = gc_mark(store, &mut live);
+            while let Some(ev) = mark.next().await {
+                if let GcMarkEvent::Error(e) = ev {
+                    return Err(e.into());
+                }
+            }
+        }
+        assert!(!live.contains(&guarded) && !live.contains(&tagged));
+
+        // The claims land AFTER the mark, before the delete.
+        let batch = blobs.batch().await?;
+        let guard = batch.temp_tag(HashAndFormat::raw(guarded)).await?;
+        store
+            .tags()
+            .set("claimed-under-guard", HashAndFormat::raw(guarded))
+            .await?;
+        store
+            .tags()
+            .set("claimed-bare", HashAndFormat::raw(tagged))
+            .await?;
+
+        // The same sweep's delete phase runs with its stale live set.
+        {
+            let mut sweep = gc_sweep(store, &live);
+            while let Some(ev) = sweep.next().await {
+                if let GcSweepEvent::Error(e) = ev {
+                    return Err(e.into());
+                }
+            }
+        }
+        drop(guard);
+        drop(batch);
+
+        // Both tagged blobs survived that sweep and are readable.
+        assert_eq!(
+            store.get_bytes(guarded).await?.as_ref(),
+            guarded_data.as_slice(),
+            "a blob claimed under a live batch guard after mark was deleted by that sweep",
+        );
+        assert_eq!(
+            store.get_bytes(tagged).await?.as_ref(),
+            tagged_data.as_slice(),
+            "a blob claimed by a persistent tag after mark was deleted by that sweep",
+        );
+
+        // And an ordinary next cycle still respects the tags (they are in the
+        // fresh mark's snapshot) …
+        let mut live2 = HashSet::new();
+        gc_run_once(store, &mut live2).await?;
+        assert_eq!(store.get_bytes(guarded).await?.as_ref(), guarded_data.as_slice());
+        assert_eq!(store.get_bytes(tagged).await?.as_ref(), tagged_data.as_slice());
+
+        // … and deleting them makes both reclaimable: protection joined the
+        // sweep, it did not leak past the tags' lifetimes.
+        store.tags().delete("claimed-under-guard").await?;
+        store.tags().delete("claimed-bare").await?;
+        let mut live3 = HashSet::new();
+        gc_run_once(store, &mut live3).await?;
+        assert!(store.get_bytes(guarded).await.is_err());
+        assert!(store.get_bytes(tagged).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "fs-store")]
+    async fn tag_after_mark_survives_the_sweep_fs() -> TestResult {
+        tracing_subscriber::fmt::try_init().ok();
+        let testdir = tempfile::tempdir()?;
+        let store = crate::store::fs::FsStore::load(testdir.path().join("db")).await?;
+        tag_after_mark_survives_the_sweep(&store).await
+    }
+
+    #[tokio::test]
+    async fn tag_after_mark_survives_the_sweep_mem() -> TestResult {
+        tracing_subscriber::fmt::try_init().ok();
+        let store = crate::store::mem::MemStore::new();
+        tag_after_mark_survives_the_sweep(&store).await
+    }
+
     async fn gc_check_deletion(store: &Store) -> TestResult {
         let temp_tag = store.add_bytes(b"foo".to_vec()).temp_tag().await?;
         let hash = temp_tag.hash();
