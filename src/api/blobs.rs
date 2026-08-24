@@ -575,8 +575,17 @@ impl Blobs {
 
     /// Add hashes to the protection set an in-flight GC sweep consults.
     /// Cleared at every mark, so this never outlives the next GC cycle.
-    pub(crate) async fn add_protected(&self, hashes: Vec<Hash>) -> RequestResult<()> {
-        let msg = AddProtectedRequest { hashes };
+    /// `poison_sweep` additionally stops the in-flight sweep deleting
+    /// anything — for claims whose members cannot be enumerated yet.
+    pub(crate) async fn add_protected(
+        &self,
+        hashes: Vec<Hash>,
+        poison_sweep: bool,
+    ) -> RequestResult<()> {
+        let msg = AddProtectedRequest {
+            hashes,
+            poison_sweep,
+        };
         self.client.rpc(msg).await??;
         Ok(())
     }
@@ -602,7 +611,7 @@ impl Blobs {
 pub(crate) async fn expand_custody(client: &ApiClient, value: HashAndFormat) -> RequestResult<()> {
     let blobs = Blobs::ref_from_sender(client);
     if value.format.is_raw() {
-        blobs.add_protected(vec![value.hash]).await?;
+        blobs.add_protected(vec![value.hash], false).await?;
         return Ok(());
     }
     let mut protect = vec![value.hash];
@@ -624,9 +633,18 @@ pub(crate) async fn expand_custody(client: &ApiClient, value: HashAndFormat) -> 
             })?;
             protect.extend(seq);
         }
-        BlobStatus::NotFound | BlobStatus::Partial { .. } => {}
+        BlobStatus::NotFound | BlobStatus::Partial { .. } => {
+            // The claim's members cannot be enumerated: the root is not here
+            // yet, but its children may be resident already — imported long
+            // ago, or delivered by a split download that skips complete
+            // children and so writes no protecting event for them. Nothing
+            // can name them, so the in-flight sweep must not keep deleting:
+            // poison it, and let the next mark decide (it either enumerates
+            // the arrived root or skips its own sweep as unbounded).
+            return blobs.add_protected(protect, true).await;
+        }
     }
-    blobs.add_protected(protect).await
+    blobs.add_protected(protect, false).await
 }
 
 /// A progress handle for a batch scoped add operation.

@@ -14,6 +14,11 @@ pub enum GcMarkEvent {
     CustomDebug(String),
     /// A custom non critical error
     CustomWarning(String, Option<crate::api::Error>),
+    /// A non-raw root could not be fully enumerated, so the live set does not
+    /// bound its collection. A sweep over such a live set would delete
+    /// children the mark could not see — the members of a claimed collection
+    /// whose root has not arrived yet — so the cycle's sweep must be skipped.
+    TraversalIncomplete(Hash),
     /// An unrecoverable error during GC
     Error(crate::api::Error),
 }
@@ -64,13 +69,16 @@ pub(super) async fn gc_mark_task(
         // we need to do this for all formats except raw
         if live.insert(hash) && !format.is_raw() {
             let mut stream = store.export_bao(hash, ChunkRanges::all()).hashes();
-            while let Some(hash) = stream.next().await {
-                match hash {
-                    Ok(hash) => {
-                        live.insert(hash);
+            while let Some(child) = stream.next().await {
+                match child {
+                    Ok(child) => {
+                        live.insert(child);
                     }
                     Err(e) => {
                         warn!("error while traversing hashseq: {e:?}");
+                        // The collection is unbounded from here: some of its
+                        // members may be resident and were not marked live.
+                        co.yield_(GcMarkEvent::TraversalIncomplete(hash)).await;
                     }
                 }
             }
@@ -178,6 +186,7 @@ pub type ProtectCb = Arc<
 
 pub async fn gc_run_once(store: &Store, live: &mut HashSet<Hash>) -> crate::api::Result<()> {
     debug!(externally_protected = live.len(), "gc: start");
+    let mut sweep_safe = true;
     {
         store.clear_protected().await?;
         let mut stream = gc_mark(store, live);
@@ -189,12 +198,30 @@ pub async fn gc_run_once(store: &Store, live: &mut HashSet<Hash>) -> crate::api:
                 GcMarkEvent::CustomWarning(msg, err) => {
                     warn!("{}: {:?}", msg, err);
                 }
+                GcMarkEvent::TraversalIncomplete(root) => {
+                    // A claimed collection the mark cannot bound: sweeping now
+                    // would delete resident children the live set missed. Skip
+                    // this cycle's sweep; once the root arrives, a later mark
+                    // enumerates the collection and sweeping resumes. Loud,
+                    // because a root that never arrives makes the store
+                    // grow-only until the claim is released.
+                    warn!(
+                        "gc: skipping sweep — collection root {} is claimed but not \
+                         enumerable yet",
+                        root.to_hex()
+                    );
+                    sweep_safe = false;
+                }
                 GcMarkEvent::Error(err) => {
                     error!("error during gc mark: {:?}", err);
                     return Err(err);
                 }
             }
         }
+    }
+    if !sweep_safe {
+        debug!("gc: mark incomplete, sweep skipped");
+        return Ok(());
     }
     debug!(total_protected = live.len(), "gc: sweep");
     {
@@ -641,6 +668,170 @@ mod tests {
         tracing_subscriber::fmt::try_init().ok();
         let store = crate::store::mem::MemStore::new();
         hash_seq_tag_after_mark_survives_the_sweep(&store).await
+    }
+
+    /// A HashSeq claim whose root has NOT arrived yet still protects the
+    /// collection — including children that are already resident.
+    ///
+    /// At claim time nobody can enumerate the children (the root's bytes do
+    /// not exist locally), and when the root later arrives, resident children
+    /// receive no write event (split downloads skip complete children). So
+    /// expansion alone cannot cover this transition; the claim must instead
+    /// stop the in-flight sweep (poison), and a mark that cannot enumerate a
+    /// claimed root must skip its own sweep. Staged both ways: the same stale
+    /// sweep racing a root that arrives mid-sweep, and a full GC cycle run
+    /// while a claimed root is still absent.
+    async fn late_root_hash_seq_claim_survives_the_sweep(store: &Store) -> TestResult<()> {
+        use crate::{api::blobs::AddBytesOptions, hashseq::HashSeq, BlobFormat};
+        let blobs = store.blobs();
+
+        let mk_child = |data: &'static [u8]| async move {
+            let tt = blobs.add_slice(data).temp_tag().await?;
+            let hash = tt.hash();
+            drop(tt);
+            TestResult::<Hash>::Ok(hash)
+        };
+        // Children resident and unreferenced; the roots' BYTES are computed
+        // but deliberately not imported yet.
+        let a = mk_child(b"late child a").await?;
+        let b = mk_child(b"late child b").await?;
+        let c = mk_child(b"late child c").await?;
+        let d = mk_child(b"late child d").await?;
+        let seq_ab: HashSeq = [a, b].into_iter().collect();
+        let seq_cd: HashSeq = [c, d].into_iter().collect();
+        let bytes_ab: bytes::Bytes = seq_ab.into();
+        let bytes_cd: bytes::Bytes = seq_cd.into();
+        let root_ab = Hash::new(&bytes_ab);
+        let root_cd = Hash::new(&bytes_cd);
+
+        // Mark runs first: nothing is claimed, nothing is live.
+        store.blobs().clear_protected().await?;
+        let mut live = HashSet::new();
+        {
+            let mut mark = gc_mark(store, &mut live);
+            while let Some(ev) = mark.next().await {
+                if let GcMarkEvent::Error(e) = ev {
+                    return Err(e.into());
+                }
+            }
+        }
+
+        // The claims land with ABSENT roots: one temp guard, one persistent
+        // tag. Acknowledging them poisons the in-flight sweep — their members
+        // are unknowable.
+        let batch = blobs.batch().await?;
+        let guard = batch.temp_tag(HashAndFormat::hash_seq(root_ab)).await?;
+        store
+            .tags()
+            .set("late-claim", HashAndFormat::hash_seq(root_cd))
+            .await?;
+
+        // The roots arrive mid-sweep-window. Their pre-existing children get
+        // no write event for this.
+        for data in [bytes_ab.clone(), bytes_cd.clone()] {
+            let tt = blobs
+                .add_bytes_with_opts(AddBytesOptions {
+                    data,
+                    format: BlobFormat::HashSeq,
+                })
+                .temp_tag()
+                .await?;
+            drop(tt);
+        }
+
+        // The stale sweep runs — and must delete nothing.
+        {
+            let mut sweep = gc_sweep(store, &live);
+            while let Some(ev) = sweep.next().await {
+                if let GcSweepEvent::Error(e) = ev {
+                    return Err(e.into());
+                }
+            }
+        }
+        for (h, data) in [
+            (a, b"late child a".as_slice()),
+            (b, b"late child b".as_slice()),
+            (c, b"late child c".as_slice()),
+            (d, b"late child d".as_slice()),
+        ] {
+            assert_eq!(
+                store.get_bytes(h).await?.as_ref(),
+                data,
+                "a resident child of a late-root claim was deleted by the stale sweep",
+            );
+        }
+        assert!(store.get_bytes(root_ab).await.is_ok());
+        assert!(store.get_bytes(root_cd).await.is_ok());
+
+        // An ordinary next cycle: both roots are complete now, the mark
+        // traverses them, everything claimed stays.
+        let mut live2 = HashSet::new();
+        gc_run_once(store, &mut live2).await?;
+        for h in [a, b, c, d, root_ab, root_cd] {
+            assert!(store.get_bytes(h).await.is_ok());
+        }
+
+        // The full-cycle form: a third claim whose root NEVER arrives makes
+        // the mark unable to bound the collection, so the whole sweep is
+        // skipped — proven by releasing the temp guard: its collection would
+        // be reclaimable, and must survive the skipped sweep anyway.
+        let e = mk_child(b"late child e").await?;
+        let f = mk_child(b"late child f").await?;
+        let seq_ef: HashSeq = [e, f].into_iter().collect();
+        let bytes_ef: bytes::Bytes = seq_ef.into();
+        let root_ef = Hash::new(&bytes_ef);
+        store
+            .tags()
+            .set("unresolvable-claim", HashAndFormat::hash_seq(root_ef))
+            .await?;
+        drop(guard);
+        drop(batch);
+        let mut live3 = HashSet::new();
+        gc_run_once(store, &mut live3).await?;
+        for h in [a, b, root_ab, e, f] {
+            assert!(
+                store.get_bytes(h).await.is_ok(),
+                "a cycle whose mark cannot enumerate a claimed root must not sweep",
+            );
+        }
+
+        // Releasing the unresolvable claim lets GC resume: the released
+        // guard's collection is reclaimed, the persistent tag's stays.
+        store.tags().delete("unresolvable-claim").await?;
+        let mut live4 = HashSet::new();
+        gc_run_once(store, &mut live4).await?;
+        assert!(store.get_bytes(root_ab).await.is_err());
+        assert!(store.get_bytes(a).await.is_err());
+        assert!(store.get_bytes(b).await.is_err());
+        assert!(store.get_bytes(e).await.is_err());
+        assert!(store.get_bytes(f).await.is_err());
+        assert!(store.get_bytes(c).await.is_ok());
+        assert!(store.get_bytes(d).await.is_ok());
+
+        // And releasing the last claim reclaims the rest.
+        store.tags().delete("late-claim").await?;
+        let mut live5 = HashSet::new();
+        gc_run_once(store, &mut live5).await?;
+        assert!(store.get_bytes(root_cd).await.is_err());
+        assert!(store.get_bytes(c).await.is_err());
+        assert!(store.get_bytes(d).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "fs-store")]
+    async fn late_root_hash_seq_claim_survives_the_sweep_fs() -> TestResult {
+        tracing_subscriber::fmt::try_init().ok();
+        let testdir = tempfile::tempdir()?;
+        let store = crate::store::fs::FsStore::load(testdir.path().join("db")).await?;
+        late_root_hash_seq_claim_survives_the_sweep(&store).await
+    }
+
+    #[tokio::test]
+    async fn late_root_hash_seq_claim_survives_the_sweep_mem() -> TestResult {
+        tracing_subscriber::fmt::try_init().ok();
+        let store = crate::store::mem::MemStore::new();
+        late_root_hash_seq_claim_survives_the_sweep(&store).await
     }
 
     async fn gc_check_deletion(store: &Store) -> TestResult {

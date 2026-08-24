@@ -135,6 +135,7 @@ impl MemStore {
                 options: Arc::new(Options::default()),
                 temp_tags: Default::default(),
                 protected: Default::default(),
+                sweep_poisoned: false,
                 idle_waiters: Default::default(),
             }
             .run(),
@@ -160,6 +161,7 @@ struct Actor {
     // idle waiters
     idle_waiters: Vec<irpc::channel::oneshot::Sender<()>>,
     protected: HashSet<Hash>,
+    sweep_poisoned: bool,
 }
 
 impl Actor {
@@ -465,8 +467,14 @@ impl Actor {
                     // A live temp tag or a protected hash blocks a non-force
                     // delete even when the deciding mark predates them — the
                     // in-flight-sweep linearization (see the fs store's
-                    // DeleteBlobs filter and set_tag for the two halves).
-                    if !force && (self.protected.contains(&hash) || self.temp_tags.contains(hash))
+                    // DeleteBlobs filter and set_tag for the two halves). A
+                    // poisoned sweep deletes nothing at all: an unexpandable
+                    // collection claim means the deciding mark cannot know
+                    // which hashes are claimed.
+                    if !force
+                        && (self.sweep_poisoned
+                            || self.protected.contains(&hash)
+                            || self.temp_tags.contains(hash))
                     {
                         continue;
                     }
@@ -480,11 +488,18 @@ impl Actor {
                 self.spawn(handle_batch(cmd, id, scope));
             }
             Command::ClearProtected(cmd) => {
+                // A mark starting resets delete-time protection AND the poison
+                // an unexpandable claim raised: this mark decides for itself
+                // whether its sweep is safe.
                 self.protected.clear();
+                self.sweep_poisoned = false;
                 cmd.tx.send(Ok(())).await.ok();
             }
             Command::AddProtected(cmd) => {
                 self.protected.extend(cmd.inner.hashes.iter().copied());
+                if cmd.inner.poison_sweep {
+                    self.sweep_poisoned = true;
+                }
                 cmd.tx.send(Ok(())).await.ok();
             }
             Command::ExportRanges(cmd) => {

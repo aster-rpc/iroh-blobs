@@ -281,22 +281,41 @@ fn handle_dump(cmd: Dump, tables: &impl ReadableTables) -> ActorResult<()> {
 
 async fn handle_clear_protected(
     cmd: ClearProtectedMsg,
-    protected: &mut HashSet<Hash>,
+    protection: &mut Protection,
 ) -> ActorResult<()> {
     trace!("{cmd:?}");
-    protected.clear();
+    // A mark starting is the reset point for delete-time protection AND for
+    // the poison an unexpandable claim raised: this mark decides for itself
+    // whether its sweep is safe (`GcMarkEvent::TraversalIncomplete`).
+    protection.protected.clear();
+    protection.sweep_poisoned = false;
     cmd.tx.send(Ok(())).await.ok();
     Ok(())
 }
 
 async fn handle_add_protected(
     cmd: AddProtectedMsg,
-    protected: &mut HashSet<Hash>,
+    protection: &mut Protection,
 ) -> ActorResult<()> {
     trace!("{cmd:?}");
-    protected.extend(cmd.inner.hashes.iter().copied());
+    protection.protected.extend(cmd.inner.hashes.iter().copied());
+    if cmd.inner.poison_sweep {
+        // The claim cannot be expanded, so an in-flight sweep might delete
+        // members of the claimed collection nobody can enumerate. Stop it
+        // deleting; the next mark resets this and decides for itself.
+        protection.sweep_poisoned = true;
+    }
     cmd.tx.send(Ok(())).await.ok();
     Ok(())
+}
+
+/// The delete-time protection an in-flight sweep's delete phase consults:
+/// the hash set joined by writes and tag/claim creation, and the poison flag
+/// an unexpandable claim raises. Both reset at every mark.
+#[derive(Debug, Default)]
+pub(super) struct Protection {
+    pub(super) protected: HashSet<Hash>,
+    pub(super) sweep_poisoned: bool,
 }
 
 fn blob_status(tables: &impl ReadableTables, hash: Hash) -> ActorResult<BlobStatus> {
@@ -465,14 +484,14 @@ async fn handle_list_tags(msg: ListTagsMsg, tables: &impl ReadableTables) -> Act
 
 fn handle_update(
     cmd: Update,
-    protected: &mut HashSet<Hash>,
+    protection: &mut Protection,
     tables: &mut Tables,
 ) -> ActorResult<()> {
     trace!("{cmd:?}");
     let Update {
         hash, state, tx, ..
     } = cmd;
-    protected.insert(hash);
+    let _ = protection.protected.insert(hash);
     trace!("updating hash {} to {}", hash.to_hex(), state.fmt_short());
     let old_entry_opt = tables.blobs.get(hash)?.map(|e| e.value());
     let (state, data, outboard): (_, Option<Bytes>, Option<Bytes>) = match state {
@@ -528,12 +547,12 @@ fn handle_update(
     Ok(())
 }
 
-fn handle_set(cmd: Set, protected: &mut HashSet<Hash>, tables: &mut Tables) -> ActorResult<()> {
+fn handle_set(cmd: Set, protection: &mut Protection, tables: &mut Tables) -> ActorResult<()> {
     trace!("{cmd:?}");
     let Set {
         state, hash, tx, ..
     } = cmd;
-    protected.insert(hash);
+    let _ = protection.protected.insert(hash);
     let (state, data, outboard): (_, Option<Bytes>, Option<Bytes>) = match state {
         EntryState::Complete {
             data_location,
@@ -595,7 +614,7 @@ pub struct Actor {
     cmds: PeekableReceiver<Command>,
     ds: DeleteHandle,
     options: BatchOptions,
-    protected: HashSet<Hash>,
+    protection: Protection,
 }
 
 impl Actor {
@@ -628,12 +647,12 @@ impl Actor {
             cmds,
             ds,
             options,
-            protected: Default::default(),
+            protection: Default::default(),
         })
     }
 
     async fn handle_readonly(
-        protected: &mut HashSet<Hash>,
+        protection: &mut Protection,
         tables: &impl ReadableTables,
         cmd: ReadOnlyCommand,
         op: TxnNum,
@@ -648,8 +667,8 @@ impl Actor {
             ReadOnlyCommand::Get(cmd) => handle_get(cmd, tables),
             ReadOnlyCommand::Dump(cmd) => handle_dump(cmd, tables),
             ReadOnlyCommand::ListTags(cmd) => handle_list_tags(cmd, tables).await,
-            ReadOnlyCommand::ClearProtected(cmd) => handle_clear_protected(cmd, protected).await,
-            ReadOnlyCommand::AddProtected(cmd) => handle_add_protected(cmd, protected).await,
+            ReadOnlyCommand::ClearProtected(cmd) => handle_clear_protected(cmd, protection).await,
+            ReadOnlyCommand::AddProtected(cmd) => handle_add_protected(cmd, protection).await,
             ReadOnlyCommand::GetBlobStatus(cmd) => handle_get_blob_status(cmd, tables).await,
             ReadOnlyCommand::GetBlobStatusMany(cmd) => {
                 handle_get_blob_status_many(cmd, tables).await
@@ -659,7 +678,7 @@ impl Actor {
     }
 
     async fn delete(
-        protected: &mut HashSet<Hash>,
+        protection: &mut Protection,
         tables: &mut Tables<'_>,
         cmd: DeleteBlobsMsg,
     ) -> ActorResult<()> {
@@ -668,7 +687,14 @@ impl Actor {
             ..
         } = cmd;
         for hash in hashes {
-            if !force && protected.contains(&hash) {
+            if !force && protection.sweep_poisoned {
+                // An unexpandable collection claim exists: the sweep that
+                // decided this delete cannot know the claim's members, so it
+                // must not keep deleting anything.
+                trace!("delete {hash}: skip (sweep poisoned by an unexpandable claim)");
+                continue;
+            }
+            if !force && protection.protected.contains(&hash) {
                 trace!("delete {hash}: skip (protected)");
                 continue;
             }
@@ -721,7 +747,7 @@ impl Actor {
 
     async fn set_tag(
         tables: &mut Tables<'_>,
-        protected: &mut HashSet<Hash>,
+        protection: &mut Protection,
         cmd: SetTagMsg,
     ) -> ActorResult<()> {
         trace!("{cmd:?}");
@@ -736,7 +762,7 @@ impl Actor {
         // so inserting here linearizes tag creation against the sweep. The
         // next mark clears the set and re-snapshots the tags, so protection
         // does not outlive the tag.
-        let _ = protected.insert(value.hash);
+        let _ = protection.protected.insert(value.hash);
         let res = tables
             .tags
             .insert(tag, value)
@@ -748,7 +774,7 @@ impl Actor {
 
     async fn create_tag(
         tables: &mut Tables<'_>,
-        protected: &mut HashSet<Hash>,
+        protection: &mut Protection,
         cmd: CreateTagMsg,
     ) -> ActorResult<()> {
         trace!("{cmd:?}");
@@ -759,7 +785,7 @@ impl Actor {
         } = cmd;
         // Same linearization as `set_tag`: the auto tag must protect its hash
         // against an in-flight sweep whose mark predates it.
-        let _ = protected.insert(value.hash);
+        let _ = protection.protected.insert(value.hash);
         let tag = {
             let tag = Tag::auto(SystemTime::now(), |x| {
                 matches!(tables.tags.get(Tag(Bytes::copy_from_slice(x))), Ok(Some(_)))
@@ -816,7 +842,7 @@ impl Actor {
     }
 
     async fn handle_readwrite(
-        protected: &mut HashSet<Hash>,
+        protection: &mut Protection,
         tables: &mut Tables<'_>,
         cmd: ReadWriteCommand,
         op: TxnNum,
@@ -828,11 +854,11 @@ impl Actor {
         );
         let _guard = span.enter();
         match cmd {
-            ReadWriteCommand::Update(cmd) => handle_update(cmd, protected, tables),
-            ReadWriteCommand::Set(cmd) => handle_set(cmd, protected, tables),
-            ReadWriteCommand::DeleteBlobw(cmd) => Self::delete(protected, tables, cmd).await,
-            ReadWriteCommand::SetTag(cmd) => Self::set_tag(tables, protected, cmd).await,
-            ReadWriteCommand::CreateTag(cmd) => Self::create_tag(tables, protected, cmd).await,
+            ReadWriteCommand::Update(cmd) => handle_update(cmd, protection, tables),
+            ReadWriteCommand::Set(cmd) => handle_set(cmd, protection, tables),
+            ReadWriteCommand::DeleteBlobw(cmd) => Self::delete(protection, tables, cmd).await,
+            ReadWriteCommand::SetTag(cmd) => Self::set_tag(tables, protection, cmd).await,
+            ReadWriteCommand::CreateTag(cmd) => Self::create_tag(tables, protection, cmd).await,
             ReadWriteCommand::DeleteTags(cmd) => Self::delete_tags(tables, cmd).await,
             ReadWriteCommand::RenameTag(cmd) => Self::rename_tag(tables, cmd).await,
             ReadWriteCommand::ProcessExit(cmd) => {
@@ -842,17 +868,17 @@ impl Actor {
     }
 
     async fn handle_non_toplevel(
-        protected: &mut HashSet<Hash>,
+        protection: &mut Protection,
         tables: &mut Tables<'_>,
         cmd: NonTopLevelCommand,
         op: TxnNum,
     ) -> ActorResult<()> {
         match cmd {
             NonTopLevelCommand::ReadOnly(cmd) => {
-                Self::handle_readonly(protected, tables, cmd, op).await
+                Self::handle_readonly(protection, tables, cmd, op).await
             }
             NonTopLevelCommand::ReadWrite(cmd) => {
-                Self::handle_readwrite(protected, tables, cmd, op).await
+                Self::handle_readwrite(protection, tables, cmd, op).await
             }
         }
     }
@@ -926,7 +952,7 @@ impl Actor {
                     let mut n = 0;
                     while let Some(cmd) = self.cmds.extract(Command::read_only, &mut timeout).await
                     {
-                        Self::handle_readonly(&mut self.protected, &tables, cmd, op).await?;
+                        Self::handle_readonly(&mut self.protection, &tables, cmd, op).await?;
                         n += 1;
                         if n >= options.max_read_batch {
                             break;
@@ -950,7 +976,7 @@ impl Actor {
                         .extract(Command::non_top_level, &mut timeout)
                         .await
                     {
-                        Self::handle_non_toplevel(&mut self.protected, &mut tables, cmd, op)
+                        Self::handle_non_toplevel(&mut self.protection, &mut tables, cmd, op)
                             .await?;
                         n += 1;
                         if n >= options.max_write_batch {

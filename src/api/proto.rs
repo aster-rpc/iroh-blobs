@@ -163,6 +163,14 @@ pub struct ClearProtectedRequest;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AddProtectedRequest {
     pub hashes: Vec<Hash>,
+    /// The claim these hashes protect could not be fully expanded (a non-raw
+    /// root that is not locally complete names children nobody can enumerate
+    /// yet). An in-flight sweep might therefore delete members of the claimed
+    /// collection it cannot know about, so it must not keep deleting: this
+    /// poisons non-force deletes until the next mark resets the flag — and
+    /// that next mark either enumerates the collection (root arrived) or
+    /// skips its own sweep (see `GcMarkEvent::TraversalIncomplete`).
+    pub poison_sweep: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
