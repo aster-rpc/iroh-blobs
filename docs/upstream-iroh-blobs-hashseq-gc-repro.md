@@ -1,5 +1,7 @@
 # GC skips a live `HashSeq` root's children
 
+Upstream tracking: [n0-computer/iroh-blobs#256](https://github.com/n0-computer/iroh-blobs/issues/256)
+
 Suggested upstream MR title:
 
 > fix(gc): traverse collection roots even when their hash is already live
