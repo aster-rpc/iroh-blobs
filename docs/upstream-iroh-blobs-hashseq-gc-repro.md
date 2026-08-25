@@ -30,6 +30,28 @@ root names them.
 The bug is present on current upstream `main` and predates the Aster custody
 changes. The reproduction below uses only the pre-existing GC API.
 
+## Reproduction in plain language
+
+1. Create a blob (the child), then drop its temporary tag. The child is now
+   eligible for collection unless something else retains it.
+2. Create a `HashSeq` root that names the child.
+3. Give that root a persistent **HashSeq** tag, then drop the temporary tag
+   returned while storing the root. The persistent collection tag is now the
+   sole reason the root and its child should survive.
+4. Put the root hash in GC's `live` set before the mark visits the persistent
+   HashSeq tag. This is the essential trigger; it deterministically represents
+   the protection callback, a Raw alias visited first, or the root already
+   being a member of another live collection.
+5. Run GC.
+6. Observe that the root survives but, before the fix, its child is collected,
+   leaving the live HashSeq pointing at missing content.
+
+Dropping `root_tag` in step 3 is not what triggers the bug. `root_tag` is a
+temporary import guard. It is released only after the persistent HashSeq tag
+has been installed, modelling the ordinary handoff from temporary custody to
+durable retention. Keeping it would add a redundant second collection claim
+and obscure which contract the test is exercising.
+
 ## Deterministic reproduction
 
 Add this helper and the two store wrappers to `src/store/gc.rs`'s existing
@@ -46,8 +68,8 @@ async fn already_live_hash_seq_root_still_marks_children(
     let child = child_tag.hash();
     drop(child_tag);
 
-    // Store a HashSeq naming that child, then retain it only through an
-    // explicit HashSeq tag.
+    // Store a HashSeq naming that child, then promote its temporary import
+    // guard to an explicit persistent HashSeq tag.
     let sequence: HashSeq = [child].into_iter().collect();
     let root_tag = blobs
         .add_bytes_with_opts(AddBytesOptions {
@@ -57,11 +79,11 @@ async fn already_live_hash_seq_root_still_marks_children(
         .temp_tag()
         .await?;
     let root = root_tag.hash();
-    drop(root_tag);
     store
         .tags()
         .set("live-collection", HashAndFormat::hash_seq(root))
         .await?;
+    drop(root_tag);
 
     // This is the deterministic equivalent of a raw alias being visited
     // first: the root hash is live before GC examines its HashSeq descriptor.
@@ -120,4 +142,3 @@ has both `Raw` and `HashSeq` roots.
 Pre-seeding `live` is intentional. A test containing both root formats but
 depending on `HashSet` iteration order would be probabilistic. Reverting the
 fix to the joined condition above makes both deterministic store variants fail.
-
